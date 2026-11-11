@@ -9,6 +9,8 @@ import {
   addSongsToPlaylist,
 } from '@/api/netease'
 import { classifySongs, groupByDimension } from '@/classifier'
+import { suggestExistingPlaylists } from '@/classifier/organize-ai'
+import type { OrganizeAIInput } from '@/types/playlist-organize'
 
 chrome.runtime.onMessage.addListener(
   (message: ExtensionMessage, sender, sendResponse: (r: ExtensionResponse) => void) => {
@@ -48,6 +50,12 @@ async function handleMessage(message: ExtensionMessage, sender?: chrome.runtime.
       const { pid, trackIds } = message.data as { pid: number; trackIds: number[] }
       await addSongsToPlaylist(pid, trackIds)
       return { success: true }
+    }
+
+    case 'SUGGEST_EXISTING_PLAYLISTS': {
+      const settings = await getSettings()
+      if (!settings.enableAI) throw new Error('AI 建议已在插件设置中关闭，可继续使用本地规则和手工确认')
+      return suggestExistingPlaylists(message.data as OrganizeAIInput, settings.deepseekApiKey)
     }
 
     case 'CLASSIFY_SONGS': {

@@ -12,6 +12,12 @@ interface Props {
 export function Home({ onNavigate }: Props) {
   const features: FeatureItem[] = [
     {
+      icon: '🗂️',
+      title: '整理到已有歌单',
+      desc: '按已有分类归档到多个歌单，不确定的歌曲保留原地',
+      action: () => onNavigate('organize'),
+    },
+    {
       icon: '🧹',
       title: '歌单对比清理',
       desc: '仅从 A 移除已存在于 B 的歌曲，B 保持只读',

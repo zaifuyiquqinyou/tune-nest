@@ -10,6 +10,7 @@ import { Home } from './pages/Home'
 import { PlaylistCleanup } from './pages/PlaylistCleanup'
 import { PlaylistExport } from './pages/PlaylistExport'
 import { PlaylistMerge } from './pages/PlaylistMerge'
+import { PlaylistOrganize } from './pages/PlaylistOrganize'
 import type { Playlist, Song, DimensionSelection, ClassifyResult, CategoryGroup } from '@/types'
 import { DIMENSION_META } from '@/types'
 
@@ -18,7 +19,7 @@ const CURRENT_VERSION = (() => {
 })()
 const GITHUB_REPO = 'fy-xbot/tune-nest'
 
-export type Step = 'login' | 'home' | 'select' | 'dimensions' | 'progress' | 'result' | 'create' | 'top-record' | 'cleanup' | 'export' | 'merge'
+export type Step = 'login' | 'home' | 'select' | 'dimensions' | 'progress' | 'result' | 'create' | 'top-record' | 'cleanup' | 'export' | 'merge' | 'organize'
 
 export interface AppState {
   uid: number | null
@@ -180,6 +181,14 @@ export function PanelApp() {
       case 'merge':
         return (
           <PlaylistMerge
+            uid={state.uid!}
+            onBack={() => setStep('home')}
+            onBusyChange={setPlaylistBusy}
+          />
+        )
+      case 'organize':
+        return (
+          <PlaylistOrganize
             uid={state.uid!}
             onBack={() => setStep('home')}
             onBusyChange={setPlaylistBusy}

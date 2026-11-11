@@ -12,6 +12,12 @@ interface Props {
 export function Home({ onNavigate }: Props) {
   const features: FeatureItem[] = [
     {
+      icon: '🧹',
+      title: '歌单对比清理',
+      desc: '仅从 A 移除已存在于 B 的歌曲，B 保持只读',
+      action: () => onNavigate('cleanup'),
+    },
+    {
       icon: '🎯',
       title: '智能歌单分类',
       desc: '按情绪、语种、风格等维度自动整理歌单',

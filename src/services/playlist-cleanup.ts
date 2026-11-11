@@ -1,0 +1,202 @@
+import {
+  getCleanupUserId,
+  getPlaylistSnapshotChecked,
+  removeSourcePlaylistTracks,
+} from '@/api/netease-direct'
+import type {
+  PlaylistCleanupPlan,
+  PlaylistCleanupProgress,
+  PlaylistCleanupResult,
+  PlaylistSnapshot,
+} from '@/types/playlist-cleanup'
+
+const BATCH_SIZE = 100
+let cleanupRunning = false
+
+/** 比较完整的歌曲顺序，避免仅以数量相同判断歌单未变化。 */
+function sameTrackIds(expected: readonly number[], actual: readonly number[]): boolean {
+  return expected.length === actual.length && expected.every((id, index) => id === actual[index])
+}
+
+/** 为本次执行复制并冻结角色与歌曲列表，后续界面变更不能重定向移除目标。 */
+function freezeSnapshot(snapshot: PlaylistSnapshot): PlaylistSnapshot {
+  return Object.freeze({ ...snapshot, trackIds: Object.freeze([...snapshot.trackIds]) })
+}
+
+function assertDifferentPlaylists(sourceId: number, referenceId: number): void {
+  if (!Number.isSafeInteger(sourceId) || sourceId <= 0 ||
+      !Number.isSafeInteger(referenceId) || referenceId <= 0 || sourceId === referenceId) {
+    throw new Error('请选择两个不同的歌单：A 待清理，B 只读对照')
+  }
+}
+
+/** 登录账号必须仍与生成预览时相同；只能清理该账号自己创建的 A。 */
+async function assertCurrentUser(userId: number): Promise<void> {
+  if (await getCleanupUserId() !== userId) {
+    throw new Error('登录账号已变化，已停止清理，请重新登录并比对')
+  }
+}
+
+/**
+ * 只读生成清理预览：确认当前账号与 A 的归属，按 A/B 实际返回的有效 ID 计算交集。
+ * 歌曲名称和分类标签均不参与比对，B 的歌曲始终不进入写入流程。
+ */
+export async function previewPlaylistCleanup(
+  userId: number,
+  sourceId: number,
+  referenceId: number
+): Promise<PlaylistCleanupPlan> {
+  assertDifferentPlaylists(sourceId, referenceId)
+  await assertCurrentUser(userId)
+  const [source, reference] = await Promise.all([
+    getPlaylistSnapshotChecked(sourceId),
+    getPlaylistSnapshotChecked(referenceId),
+  ])
+  if (source.creatorId !== userId) {
+    throw new Error('只能清理当前账号自己创建的歌单 A')
+  }
+  const referenceIds = new Set(reference.trackIds)
+  return Object.freeze({
+    userId,
+    source,
+    reference,
+    removableTrackIds: Object.freeze(source.trackIds.filter((id) => referenceIds.has(id))),
+  })
+}
+
+/** 拒绝过期或被改写的清理计划，待移除集合必须严格等于预览 A/B 的交集。 */
+function copyValidatedPlan(preview: PlaylistCleanupPlan): PlaylistCleanupPlan {
+  const source = freezeSnapshot(preview.source)
+  const reference = freezeSnapshot(preview.reference)
+  assertDifferentPlaylists(source.id, reference.id)
+  if (source.creatorId !== preview.userId) {
+    throw new Error('清理计划中的歌单 A 不属于当前账号，请重新比对')
+  }
+  const referenceIds = new Set(reference.trackIds)
+  const removableTrackIds = source.trackIds.filter((id) => referenceIds.has(id))
+  if (!sameTrackIds(removableTrackIds, preview.removableTrackIds)) {
+    throw new Error('待移除歌曲与歌单交集不一致，请重新比对')
+  }
+  return Object.freeze({
+    userId: preview.userId,
+    source,
+    reference,
+    removableTrackIds: Object.freeze(removableTrackIds),
+  })
+}
+
+/** 每批前后核对已读取的 ID；A 只能发生预期移除，B 的 ID 与顺序必须保持一致。 */
+async function assertPlaylistState(
+  plan: PlaylistCleanupPlan,
+  expectedSourceIds: readonly number[]
+): Promise<void> {
+  const [source, reference] = await Promise.all([
+    getPlaylistSnapshotChecked(plan.source.id),
+    getPlaylistSnapshotChecked(plan.reference.id),
+  ])
+  if (reference.creatorId !== plan.reference.creatorId ||
+      !sameTrackIds(plan.reference.trackIds, reference.trackIds)) {
+    throw new Error('对照歌单 B 的歌曲或顺序已变化，已停止后续清理，请重新比对')
+  }
+  if (source.creatorId !== plan.userId || !sameTrackIds(expectedSourceIds, source.trackIds)) {
+    throw new Error('歌单 A 的内容与预期不一致，已停止后续清理，请重新比对')
+  }
+}
+
+/** 重新读取实际结果；无法核验时保留未知状态，不用请求成功次数代替移除数量。 */
+async function readCleanupResult(
+  plan: PlaylistCleanupPlan,
+  failure: string | null
+): Promise<PlaylistCleanupResult> {
+  const [sourceRead, referenceRead] = await Promise.allSettled([
+    getPlaylistSnapshotChecked(plan.source.id),
+    getPlaylistSnapshotChecked(plan.reference.id),
+  ])
+  const referenceUnchanged = referenceRead.status === 'fulfilled'
+    ? referenceRead.value.creatorId === plan.reference.creatorId &&
+      sameTrackIds(plan.reference.trackIds, referenceRead.value.trackIds)
+    : null
+  let removedCount: number | null = null
+  let remainingTrackCount: number | null = null
+  let pendingCount: number | null = null
+  let sourceVerified: boolean | null = null
+  if (sourceRead.status === 'fulfilled') {
+    const source = sourceRead.value
+    const currentIds = new Set(source.trackIds)
+    const removedIds = new Set(plan.removableTrackIds.filter((id) => !currentIds.has(id)))
+    removedCount = removedIds.size
+    pendingCount = plan.removableTrackIds.length - removedCount
+    remainingTrackCount = source.trackIds.length
+    sourceVerified = source.creatorId === plan.userId &&
+      sameTrackIds(plan.source.trackIds.filter((id) => !removedIds.has(id)), source.trackIds)
+  }
+  const completed = !failure && sourceVerified === true && referenceUnchanged === true && pendingCount === 0
+  let message = completed
+    ? '本次清理完成，已核验 A/B 可读取歌曲的内容与顺序'
+    : failure || '清理结果未通过完整核验，已停止后续清理'
+  if (!completed) {
+    if (referenceUnchanged === false) {
+      message += '；检测到 B 的歌曲或顺序变化，本功能不会对 B 进行恢复或其他写入'
+    }
+    if (sourceVerified === false) message += '；A 中存在预期移除以外的变化'
+    if (sourceRead.status === 'rejected' || referenceRead.status === 'rejected') {
+      message += '；部分歌单未能重新读取，结果尚未全部核验，请重新比对'
+    } else if (!failure && pendingCount !== 0) {
+      message = '仍有待移除歌曲存在于 A，已停止清理，请重新比对'
+    }
+  }
+  return {
+    status: completed ? 'completed' : 'stopped',
+    message,
+    removedCount,
+    remainingTrackCount,
+    pendingCount,
+    sourceVerified,
+    referenceUnchanged,
+  }
+}
+
+/**
+ * 固定 A/B 角色后分批仅从 A 移除交集，每批前后核验内容与顺序。
+ * 任意失败都停止后续写入并重新读取实际结果；不自动重试或回滚，更不会修改 B。
+ */
+export async function executePlaylistCleanup(
+  preview: PlaylistCleanupPlan,
+  onProgress?: (progress: PlaylistCleanupProgress) => void
+): Promise<PlaylistCleanupResult> {
+  if (cleanupRunning) throw new Error('已有歌单清理正在执行，请等待完成')
+  const plan = copyValidatedPlan(preview)
+  cleanupRunning = true
+  let failure: string | null = null
+  let expectedSourceIds = [...plan.source.trackIds]
+  try {
+    try {
+      await assertCurrentUser(plan.userId)
+      await assertPlaylistState(plan, expectedSourceIds)
+      for (let offset = 0; offset < plan.removableTrackIds.length; offset += BATCH_SIZE) {
+        if (offset > 0) {
+          await assertCurrentUser(plan.userId)
+          await assertPlaylistState(plan, expectedSourceIds)
+        }
+        const batch = plan.removableTrackIds.slice(offset, offset + BATCH_SIZE)
+        // 移除目标始终来自被冻结的 A，B 仅作为误写保护参数。
+        await removeSourcePlaylistTracks(plan.source.id, plan.reference.id, batch)
+        const batchIds = new Set(batch)
+        expectedSourceIds = expectedSourceIds.filter((id) => !batchIds.has(id))
+        await assertPlaylistState(plan, expectedSourceIds)
+        onProgress?.({
+          removedCount: Math.min(offset + batch.length, plan.removableTrackIds.length),
+          totalCount: plan.removableTrackIds.length,
+        })
+        if (offset + BATCH_SIZE < plan.removableTrackIds.length) {
+          await new Promise((resolve) => setTimeout(resolve, 500))
+        }
+      }
+    } catch (err) {
+      failure = err instanceof Error ? err.message : '清理请求失败，已停止后续写入'
+    }
+    return await readCleanupResult(plan, failure)
+  } finally {
+    cleanupRunning = false
+  }
+}

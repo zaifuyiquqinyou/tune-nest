@@ -7,6 +7,7 @@ import { ResultPreview } from './pages/ResultPreview'
 import { CreateConfirm } from './pages/CreateConfirm'
 import { TopRecord } from './pages/TopRecord'
 import { Home } from './pages/Home'
+import { PlaylistCleanup } from './pages/PlaylistCleanup'
 import type { Playlist, Song, DimensionSelection, ClassifyResult, CategoryGroup } from '@/types'
 import { DIMENSION_META } from '@/types'
 
@@ -15,7 +16,7 @@ const CURRENT_VERSION = (() => {
 })()
 const GITHUB_REPO = 'fy-xbot/tune-nest'
 
-export type Step = 'login' | 'home' | 'select' | 'dimensions' | 'progress' | 'result' | 'create' | 'top-record'
+export type Step = 'login' | 'home' | 'select' | 'dimensions' | 'progress' | 'result' | 'create' | 'top-record' | 'cleanup'
 
 export interface AppState {
   uid: number | null
@@ -32,6 +33,7 @@ export function PanelApp() {
   const [step, setStep] = useState<Step>('login')
   const [prevStep, setPrevStep] = useState<Step>('login')
   const [latestVersion, setLatestVersion] = useState<string | null>(null)
+  const [cleanupBusy, setCleanupBusy] = useState(false)
   const [state, setState] = useState<AppState>({
     uid: null,
     selectedPlaylists: [],
@@ -157,6 +159,14 @@ export function PanelApp() {
             }}
           />
         )
+      case 'cleanup':
+        return (
+          <PlaylistCleanup
+            uid={state.uid!}
+            onBack={() => setStep('home')}
+            onBusyChange={setCleanupBusy}
+          />
+        )
       case 'top-record':
         return (
           <TopRecord
@@ -200,6 +210,7 @@ export function PanelApp() {
               <button
                 className="text-gray-400 hover:text-gray-600 text-sm cursor-pointer transition-colors"
                 onClick={() => setStep('home')}
+                disabled={cleanupBusy}
                 title="返回主页"
               >
                 ⊞

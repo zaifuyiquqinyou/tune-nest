@@ -208,9 +208,9 @@ export async function getCleanupUserId(): Promise<number> {
   return userId
 }
 
-/** 仅列出当前账号创建的歌单，分页读取时拒绝重复页或空的后续页。 */
-export async function getCleanupPlaylists(userId: number): Promise<Playlist[]> {
-  const ownedPlaylists: Playlist[] = []
+/** 分页读取账号的自建及收藏歌单，供只读导出使用。 */
+export async function getUserPlaylistsChecked(userId: number): Promise<Playlist[]> {
+  const playlists: Playlist[] = []
   const seenIds = new Set<number>()
   let offset = 0
   let more = true
@@ -231,7 +231,7 @@ export async function getCleanupPlaylists(userId: number): Promise<Playlist[]> {
       if (seenIds.has(playlist.id)) continue
       seenIds.add(playlist.id)
       freshCount++
-      if (playlist.creator.userId === userId) ownedPlaylists.push(playlist)
+      playlists.push(playlist)
     }
     more = response.more === true
     if (more && freshCount === 0) {
@@ -239,7 +239,61 @@ export async function getCleanupPlaylists(userId: number): Promise<Playlist[]> {
     }
     offset += response.playlist.length
   }
-  return ownedPlaylists
+  return playlists
+}
+
+/** 清理和移动的在线来源仅允许选择本人创建的歌单。 */
+export async function getCleanupPlaylists(userId: number): Promise<Playlist[]> {
+  return (await getUserPlaylistsChecked(userId)).filter((playlist) => playlist.creator.userId === userId)
+}
+
+/** 获取备份所需的歌曲详情；无详情的歌曲仍由上层按 ID 保留。 */
+export async function getSongDetailsChecked(ids: readonly number[]): Promise<Song[]> {
+  if (ids.length === 0) return []
+  if (ids.length > 200 || ids.some((id) => !Number.isSafeInteger(id) || id <= 0)) {
+    throw new Error('歌曲详情查询参数无效')
+  }
+  const response = await cleanupRequest<CleanupApiResponse & {
+    songs?: Array<{
+      id: number
+      name?: string
+      ar?: Array<{ id: number; name: string }>
+      al?: { id: number; name: string }
+      dt?: number
+    }>
+  }>('/api/v3/song/detail', { c: JSON.stringify(ids.map((id) => ({ id }))) })
+  if (!Array.isArray(response.songs)) throw new Error('歌曲详情读取不完整')
+  const requested = new Set(ids)
+  return response.songs.filter((song) => song && requested.has(song.id)).map((song) => ({
+    id: song.id,
+    name: typeof song.name === 'string' ? song.name : '',
+    artists: Array.isArray(song.ar) ? song.ar.filter((artist) => artist && typeof artist.name === 'string') : [],
+    album: { id: song.al?.id || 0, name: typeof song.al?.name === 'string' ? song.al.name : '' },
+    duration: typeof song.dt === 'number' && Number.isFinite(song.dt) && song.dt >= 0 ? song.dt : 0,
+  }))
+}
+
+/** 只向目标补入缺少的歌曲，不允许将任一来源误用作目标或覆盖目标内容。 */
+export async function addTargetPlaylistTracks(
+  targetId: number,
+  sourceIds: readonly number[],
+  trackIds: readonly number[]
+): Promise<void> {
+  if (!Number.isSafeInteger(targetId) || targetId <= 0 || sourceIds.includes(targetId) ||
+      sourceIds.some((id) => !Number.isSafeInteger(id) || id <= 0)) {
+    throw new Error('合并目标必须是不同于所有来源的有效歌单')
+  }
+  if (trackIds.length === 0) return
+  if (trackIds.length > 100 || new Set(trackIds).size !== trackIds.length ||
+      trackIds.some((id) => !Number.isSafeInteger(id) || id <= 0)) {
+    throw new Error('本批待添加歌曲 ID 无效')
+  }
+  await cleanupRequest('/api/playlist/manipulate/tracks', {
+    op: 'add',
+    pid: targetId,
+    trackIds: JSON.stringify(trackIds),
+    imme: 'true',
+  })
 }
 
 /** 比对实际返回的歌曲 ID；统计总数可能过期，不能代替有效 ID 或阻断只读比对。 */

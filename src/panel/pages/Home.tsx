@@ -18,6 +18,18 @@ export function Home({ onNavigate }: Props) {
       action: () => onNavigate('cleanup'),
     },
     {
+      icon: '📂',
+      title: '导出所有歌单 TXT',
+      desc: '每个歌单一个文件，可保存到文件夹或下载 ZIP',
+      action: () => onNavigate('export'),
+    },
+    {
+      icon: '🔀',
+      title: '歌单合并 / 移动',
+      desc: '将一个或多个歌单合入目标，支持导入 TXT 备份',
+      action: () => onNavigate('merge'),
+    },
+    {
       icon: '🎯',
       title: '智能歌单分类',
       desc: '按情绪、语种、风格等维度自动整理歌单',

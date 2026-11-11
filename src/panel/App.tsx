@@ -8,6 +8,8 @@ import { CreateConfirm } from './pages/CreateConfirm'
 import { TopRecord } from './pages/TopRecord'
 import { Home } from './pages/Home'
 import { PlaylistCleanup } from './pages/PlaylistCleanup'
+import { PlaylistExport } from './pages/PlaylistExport'
+import { PlaylistMerge } from './pages/PlaylistMerge'
 import type { Playlist, Song, DimensionSelection, ClassifyResult, CategoryGroup } from '@/types'
 import { DIMENSION_META } from '@/types'
 
@@ -16,7 +18,7 @@ const CURRENT_VERSION = (() => {
 })()
 const GITHUB_REPO = 'fy-xbot/tune-nest'
 
-export type Step = 'login' | 'home' | 'select' | 'dimensions' | 'progress' | 'result' | 'create' | 'top-record' | 'cleanup'
+export type Step = 'login' | 'home' | 'select' | 'dimensions' | 'progress' | 'result' | 'create' | 'top-record' | 'cleanup' | 'export' | 'merge'
 
 export interface AppState {
   uid: number | null
@@ -33,7 +35,7 @@ export function PanelApp() {
   const [step, setStep] = useState<Step>('login')
   const [prevStep, setPrevStep] = useState<Step>('login')
   const [latestVersion, setLatestVersion] = useState<string | null>(null)
-  const [cleanupBusy, setCleanupBusy] = useState(false)
+  const [playlistBusy, setPlaylistBusy] = useState(false)
   const [state, setState] = useState<AppState>({
     uid: null,
     selectedPlaylists: [],
@@ -164,7 +166,23 @@ export function PanelApp() {
           <PlaylistCleanup
             uid={state.uid!}
             onBack={() => setStep('home')}
-            onBusyChange={setCleanupBusy}
+            onBusyChange={setPlaylistBusy}
+          />
+        )
+      case 'export':
+        return (
+          <PlaylistExport
+            uid={state.uid!}
+            onBack={() => setStep('home')}
+            onBusyChange={setPlaylistBusy}
+          />
+        )
+      case 'merge':
+        return (
+          <PlaylistMerge
+            uid={state.uid!}
+            onBack={() => setStep('home')}
+            onBusyChange={setPlaylistBusy}
           />
         )
       case 'top-record':
@@ -210,7 +228,7 @@ export function PanelApp() {
               <button
                 className="text-gray-400 hover:text-gray-600 text-sm cursor-pointer transition-colors"
                 onClick={() => setStep('home')}
-                disabled={cleanupBusy}
+                disabled={playlistBusy}
                 title="返回主页"
               >
                 ⊞

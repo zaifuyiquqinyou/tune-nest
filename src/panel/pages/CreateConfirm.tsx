@@ -1,12 +1,13 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import type { CategoryGroup } from '@/types'
 import {
   createPlaylistDirect,
-  addSongsToPlaylistDirect,
   findPlaylistByName,
-  getPlaylistTrackIds,
-  clearPlaylistTracks,
+  getCleanupUserId,
 } from '@/api/netease-direct'
+import { populatePlaylistChecked } from '@/services/playlist-populate'
+import { PlaylistFailures } from '../components/PlaylistFailures'
+import type { PlaylistTrackFailure } from '@/types/playlist-operation'
 
 interface Props {
   uid: number
@@ -22,7 +23,7 @@ const DIMENSION_LABELS: Record<string, string> = {
   genre: '风格',
 }
 
-type TaskStatus = 'pending' | 'creating' | 'done' | 'error' | 'skipped'
+type TaskStatus = 'pending' | 'creating' | 'done' | 'partial' | 'error' | 'skipped'
 type ConflictAction = 'replace' | 'append' | 'skip' | null
 
 interface PlaylistTask {
@@ -33,6 +34,8 @@ interface PlaylistTask {
   existingId?: number
   existingCount?: number
   conflictAction?: ConflictAction
+  failedTracks?: readonly PlaylistTrackFailure[]
+  creationUncertain?: boolean
 }
 
 export function CreateConfirm({ uid, grouped, onDone }: Props) {
@@ -46,6 +49,7 @@ export function CreateConfirm({ uid, grouped, onDone }: Props) {
       }))
   )
   const [running, setRunning] = useState(false)
+  const runningRef = useRef(false)
   const [checking, setChecking] = useState(true)
   const [conflictIdx, setConflictIdx] = useState<number | null>(null)
   const [editingIdx, setEditingIdx] = useState<number | null>(null)
@@ -104,6 +108,8 @@ export function CreateConfirm({ uid, grouped, onDone }: Props) {
   }
 
   const runCreate = async () => {
+    if (runningRef.current || hasConflicts || tasks.some((task) => task.creationUncertain)) return
+    runningRef.current = true
     setRunning(true)
     const updated = [...tasks]
 
@@ -111,47 +117,32 @@ export function CreateConfirm({ uid, grouped, onDone }: Props) {
       if (updated[i].status === 'skipped' || updated[i].status === 'done') continue
 
       updated[i].status = 'creating'
+      updated[i].error = undefined
+      updated[i].failedTracks = []
       setTasks([...updated])
 
       try {
-        let pid: number
-
-        if (updated[i].existingId && updated[i].conflictAction === 'replace') {
-          pid = updated[i].existingId!
-          const oldIds = await getPlaylistTrackIds(pid)
-          await clearPlaylistTracks(pid, oldIds)
-          await new Promise((r) => setTimeout(r, 500))
-        } else if (updated[i].existingId && updated[i].conflictAction === 'append') {
-          pid = updated[i].existingId!
-        } else {
-          let created: number | null = null
-          for (let retry = 0; retry < 3; retry++) {
-            try {
-              created = await createPlaylistDirect(updated[i].name)
-              break
-            } catch (e) {
-              if (retry < 2) {
-                await new Promise((r) => setTimeout(r, 2000 * (retry + 1)))
-              } else {
-                throw e
-              }
-            }
-          }
-          pid = created!
+        if (await getCleanupUserId() !== uid) throw new Error('登录账号已变化，已停止后续歌单写入')
+        let pid = updated[i].existingId
+        if (!pid) {
+          // 创建结果不明时不能自动重试，以免生成多个同名歌单。
+          updated[i].creationUncertain = true
+          pid = await createPlaylistDirect(updated[i].name)
+          updated[i].existingId = pid
+          updated[i].conflictAction = 'append'
+          updated[i].creationUncertain = false
+          setTasks([...updated])
         }
-
-        const ids = updated[i].trackIds
-        for (let j = 0; j < ids.length; j += 100) {
-          await addSongsToPlaylistDirect(pid, ids.slice(j, j + 100))
-          if (j + 100 < ids.length) {
-            await new Promise((r) => setTimeout(r, 1000))
-          }
-        }
-
-        updated[i].status = 'done'
+        const result = await populatePlaylistChecked(uid, pid, updated[i].trackIds, updated[i].conflictAction === 'replace')
+        updated[i].failedTracks = result.failedTracks
+        updated[i].status = result.status === 'completed' ? 'done' : result.status === 'partial' ? 'partial' : 'error'
+        updated[i].error = result.status === 'completed' ? undefined : result.message
+        if (result.status === 'stopped') { setTasks([...updated]); break }
       } catch (err) {
         updated[i].status = 'error'
         updated[i].error = err instanceof Error ? err.message : '未知错误'
+        setTasks([...updated])
+        break
       }
 
       setTasks([...updated])
@@ -160,12 +151,13 @@ export function CreateConfirm({ uid, grouped, onDone }: Props) {
       }
     }
 
+    runningRef.current = false
     setRunning(false)
   }
 
   const activeTasks = tasks.filter((t) => t.status !== 'skipped')
   const doneCount = tasks.filter((t) => t.status === 'done').length
-  const allDone = activeTasks.length > 0 && activeTasks.every((t) => t.status === 'done')
+  const allDone = activeTasks.length > 0 && activeTasks.every((t) => t.status === 'done' || t.status === 'partial')
 
   if (checking) {
     return (
@@ -181,6 +173,7 @@ export function CreateConfirm({ uid, grouped, onDone }: Props) {
       <p className="text-sm text-gray-500 mb-2">
         将创建 {activeTasks.length} 个歌单：
       </p>
+      <p className="text-xs text-gray-500 mb-3">单首失败会跳过并汇总，继续处理其他歌曲和歌单。替换前先补齐新歌；新歌未全部成功时保留旧歌。</p>
 
       {hasConflicts && !running && (
         <div className="mb-3 p-3 bg-amber-50 border border-amber-200 rounded-lg">
@@ -220,6 +213,7 @@ export function CreateConfirm({ uid, grouped, onDone }: Props) {
             <div className="flex-shrink-0 w-5 text-center">
               {task.status === 'done' && <span className="text-green-500">✓</span>}
               {task.status === 'error' && <span className="text-red-500">✗</span>}
+              {task.status === 'partial' && <span className="text-amber-600">!</span>}
               {task.status === 'skipped' && <span className="text-gray-400">—</span>}
               {task.status === 'creating' && (
                 <span className="inline-block w-4 h-4 border-2 border-primary border-t-transparent rounded-full animate-spin" />
@@ -268,6 +262,7 @@ export function CreateConfirm({ uid, grouped, onDone }: Props) {
               {task.error && (
                 <p className="text-xs text-red-500 mt-0.5">{task.error}</p>
               )}
+              <PlaylistFailures failures={task.failedTracks || []} songName={(id) => grouped.flatMap((group) => group.songs).find((song) => song.songId === id)?.songName} />
               {task.existingId && !task.conflictAction && !running && (
                 <div className="flex gap-1 mt-1">
                   <button className="text-xs text-blue-500 hover:underline" onClick={() => handleConflictChoice(idx, 'append')}>追加</button>
@@ -297,7 +292,7 @@ export function CreateConfirm({ uid, grouped, onDone }: Props) {
                 追加歌曲
               </button>
               <button className="tn-btn w-full bg-orange-500 text-white hover:bg-orange-600" onClick={() => handleConflictChoice(conflictIdx, 'replace')}>
-                清空后替换
+                补齐新歌后替换
               </button>
               <button className="tn-btn tn-btn-secondary w-full" onClick={() => handleConflictChoice(conflictIdx, 'skip')}>
                 跳过
@@ -308,11 +303,12 @@ export function CreateConfirm({ uid, grouped, onDone }: Props) {
       )}
 
       <div className="mt-4">
+        {tasks.some((task) => task.creationUncertain) && <p className="text-xs text-red-600 mb-2">创建结果未知，请先刷新核对同名歌单后再继续，避免重复创建。</p>}
         {!running && !allDone && (
           <button
             className="tn-btn tn-btn-primary w-full disabled:opacity-50"
             onClick={runCreate}
-            disabled={hasConflicts}
+            disabled={hasConflicts || tasks.some((task) => task.creationUncertain)}
           >
             {hasConflicts ? '请先处理同名歌单' : `开始创建 (${activeTasks.length} 个歌单)`}
           </button>
@@ -324,7 +320,7 @@ export function CreateConfirm({ uid, grouped, onDone }: Props) {
         )}
         {allDone && (
           <div className="text-center">
-            <p className="text-green-600 font-medium mb-3">全部创建完成！</p>
+            <p className="text-green-600 font-medium mb-3">{tasks.some((task) => task.status === 'partial') ? '处理结束，失败歌曲见上方清单' : '全部创建完成！'}</p>
             <button className="tn-btn tn-btn-primary" onClick={onDone}>
               完成
             </button>

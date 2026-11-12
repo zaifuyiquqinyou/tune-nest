@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { executePlaylistMerge, previewPlaylistMerge } from '@/services/playlist-merge'
 import { parsePlaylistText } from '@/utils/playlist-text'
+import { PlaylistFailures } from '../components/PlaylistFailures'
 import { usePlaylistList, usePlaylistOperation } from '../hooks/use-playlist-tools'
 import type {
   PlaylistMergePlan,
@@ -106,7 +107,7 @@ export function PlaylistMerge({ uid, onBack, onBusyChange }: Props) {
       <h3 className="text-base font-semibold text-gray-800 mb-2">歌单合并 / 移动</h3>
       <p className="text-sm text-gray-500 mb-3">勾选一个或多个来源，再选择目标歌单。相同歌曲按 ID 去重，目标已有歌曲保留。</p>
       <div className="rounded-lg border border-green-200 bg-green-50 p-3 text-xs text-green-800 mb-4">
-        先将所有候选歌曲补齐到目标并核验，再按需从来源移除。保留来源歌单本身；目标只添加歌曲。
+        先向目标补入歌曲并核验，再按需移除来源中已确认成功的歌曲。失败歌曲留在来源；目标只添加歌曲。
       </div>
       {list.loading && <p className="text-sm text-gray-500 mb-3" role="status">正在加载歌单...</p>}
       {list.error && (
@@ -210,7 +211,7 @@ export function PlaylistMerge({ uid, onBack, onBusyChange }: Props) {
             ))}
           </ul>
           <p className="text-sm text-gray-700 mt-3">共 {preview.sources.length} 个来源，合并去重后 {preview.incomingTrackIds.length} 首；{preview.move ? '从来源合计移除 ' + removalCount + ' 条记录' : '来源不移除'}。</p>
-          <p className="text-xs text-amber-700 mt-2">执行期间请勿在其他页面或客户端修改这些歌单。遇到失败会停止，可重新预览后继续。</p>
+          <p className="text-xs text-amber-700 mt-2">单首失败会跳过并汇总，未成功的歌保留在来源；其余歌曲继续处理。请勿同时修改这些歌单。账号变化、内容异常或无法核验时才停止。</p>
           <button className={buttonClass + ' tn-btn-primary w-full mt-3'} disabled={operation.busy} onClick={handleExecute}>
             确认{preview.move ? '移动' : '复制'}到「{preview.target.name}」
           </button>
@@ -226,6 +227,7 @@ export function PlaylistMerge({ uid, onBack, onBusyChange }: Props) {
       {outcome && (
         <div className={'rounded-xl p-3 mt-4 text-sm ' + (outcome.status === 'completed' ? 'bg-green-50 text-green-800' : 'bg-amber-50 text-amber-800')} role="status">
           <p className="font-semibold">{outcome.message}</p>
+          <PlaylistFailures failures={outcome.failedTracks} songName={(id) => documents.flatMap((document) => document.songs).find((song) => song.id === id)?.name} />
           <p className="text-xs mt-2">目标已补入 {outcome.addedCount ?? '未知'} 首；候选中仍缺 {outcome.missingTargetCount ?? '未知'} 首。</p>
           <p className="text-xs mt-1">目标原有歌曲及相对顺序：{outcome.targetPreserved === true ? '已核验保留' : outcome.targetPreserved === false ? '检测到变化' : '未能核验'}。</p>
           <ul className="text-xs mt-2 space-y-1">

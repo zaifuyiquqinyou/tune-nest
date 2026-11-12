@@ -3,6 +3,8 @@ import {
   getPlaylistSnapshotChecked,
   removeSourcePlaylistTracks,
 } from '@/api/netease-direct'
+import { mutatePlaylistTracks } from '@/services/playlist-track-mutation'
+import type { PlaylistTrackFailure } from '@/types/playlist-operation'
 import type {
   PlaylistCleanupPlan,
   PlaylistCleanupProgress,
@@ -94,11 +96,11 @@ async function assertPlaylistState(
     getPlaylistSnapshotChecked(plan.source.id),
     getPlaylistSnapshotChecked(plan.reference.id),
   ])
-  if (reference.creatorId !== plan.reference.creatorId ||
+  if (reference.creatorId !== plan.reference.creatorId || reference.name !== plan.reference.name ||
       !sameTrackIds(plan.reference.trackIds, reference.trackIds)) {
     throw new Error('对照歌单 B 的歌曲或顺序已变化，已停止后续清理，请重新比对')
   }
-  if (source.creatorId !== plan.userId || !sameTrackIds(expectedSourceIds, source.trackIds)) {
+  if (source.creatorId !== plan.userId || source.name !== plan.source.name || !sameTrackIds(expectedSourceIds, source.trackIds)) {
     throw new Error('歌单 A 的内容与预期不一致，已停止后续清理，请重新比对')
   }
 }
@@ -106,6 +108,8 @@ async function assertPlaylistState(
 /** 重新读取实际结果；无法核验时保留未知状态，不用请求成功次数代替移除数量。 */
 async function readCleanupResult(
   plan: PlaylistCleanupPlan,
+  expectedSourceIds: readonly number[],
+  failedTracks: readonly PlaylistTrackFailure[],
   failure: string | null
 ): Promise<PlaylistCleanupResult> {
   const [sourceRead, referenceRead] = await Promise.allSettled([
@@ -113,7 +117,7 @@ async function readCleanupResult(
     getPlaylistSnapshotChecked(plan.reference.id),
   ])
   const referenceUnchanged = referenceRead.status === 'fulfilled'
-    ? referenceRead.value.creatorId === plan.reference.creatorId &&
+    ? referenceRead.value.creatorId === plan.reference.creatorId && referenceRead.value.name === plan.reference.name &&
       sameTrackIds(plan.reference.trackIds, referenceRead.value.trackIds)
     : null
   let removedCount: number | null = null
@@ -127,14 +131,20 @@ async function readCleanupResult(
     removedCount = removedIds.size
     pendingCount = plan.removableTrackIds.length - removedCount
     remainingTrackCount = source.trackIds.length
-    sourceVerified = source.creatorId === plan.userId &&
-      sameTrackIds(plan.source.trackIds.filter((id) => !removedIds.has(id)), source.trackIds)
+    sourceVerified = source.creatorId === plan.userId && source.name === plan.source.name &&
+      sameTrackIds(expectedSourceIds, source.trackIds)
   }
-  const completed = !failure && sourceVerified === true && referenceUnchanged === true && pendingCount === 0
+  let accountVerified = false
+  try { accountVerified = await getCleanupUserId() === plan.userId } catch { /* 无法确认账号时不报告完成。 */ }
+  const failedIds = new Set(failedTracks.map((item) => item.songId))
+  const pendingKnown = expectedSourceIds.every((id) => !plan.removableTrackIds.includes(id) || failedIds.has(id))
+  const finished = !failure && accountVerified && sourceVerified === true && referenceUnchanged === true && pendingKnown
+  const completed = finished && pendingCount === 0
   let message = completed
     ? '本次清理完成，已核验 A/B 可读取歌曲的内容与顺序'
+    : finished ? '本次清理结束，已跳过 ' + failedIds.size + ' 首移除失败的歌曲，仍保留在 A；其余歌曲已处理，B 保持不变'
     : failure || '清理结果未通过完整核验，已停止后续清理'
-  if (!completed) {
+  if (!finished) {
     if (referenceUnchanged === false) {
       message += '；检测到 B 的歌曲或顺序变化，本功能不会对 B 进行恢复或其他写入'
     }
@@ -146,7 +156,8 @@ async function readCleanupResult(
     }
   }
   return {
-    status: completed ? 'completed' : 'stopped',
+    status: completed ? 'completed' : finished ? 'partial' : 'stopped',
+    failedTracks,
     message,
     removedCount,
     remainingTrackCount,
@@ -158,7 +169,7 @@ async function readCleanupResult(
 
 /**
  * 固定 A/B 角色后分批仅从 A 移除交集，每批前后核验内容与顺序。
- * 任意失败都停止后续写入并重新读取实际结果；不自动重试或回滚，更不会修改 B。
+ * 明确的单曲移除失败记录后继续；未知结果或额外变化停止写入，B 始终只读。
  */
 export async function executePlaylistCleanup(
   preview: PlaylistCleanupPlan,
@@ -168,24 +179,24 @@ export async function executePlaylistCleanup(
   const plan = copyValidatedPlan(preview)
   cleanupRunning = true
   let failure: string | null = null
-  let expectedSourceIds = [...plan.source.trackIds]
+  let expectedSourceIds = plan.source.trackIds
+  const failedTracks: PlaylistTrackFailure[] = []
   try {
     try {
       await assertCurrentUser(plan.userId)
       await assertPlaylistState(plan, expectedSourceIds)
       for (let offset = 0; offset < plan.removableTrackIds.length; offset += BATCH_SIZE) {
-        if (offset > 0) {
-          await assertCurrentUser(plan.userId)
-          await assertPlaylistState(plan, expectedSourceIds)
-        }
         const batch = plan.removableTrackIds.slice(offset, offset + BATCH_SIZE)
         // 移除目标始终来自被冻结的 A，B 仅作为误写保护参数。
-        await removeSourcePlaylistTracks(plan.source.id, plan.reference.id, batch)
-        const batchIds = new Set(batch)
-        expectedSourceIds = expectedSourceIds.filter((id) => !batchIds.has(id))
-        await assertPlaylistState(plan, expectedSourceIds)
+        await mutatePlaylistTracks({
+          userId: plan.userId, playlist: plan.source, expectedIds: expectedSourceIds, trackIds: batch, operation: 'remove',
+          write: (ids) => removeSourcePlaylistTracks(plan.source.id, plan.reference.id, ids),
+          beforeWrite: () => assertPlaylistState(plan, expectedSourceIds),
+          afterWrite: () => assertPlaylistState(plan, expectedSourceIds),
+          onVerified: (current) => { expectedSourceIds = current }, onFailure: (item) => { failedTracks.push(item) },
+        })
         onProgress?.({
-          removedCount: Math.min(offset + batch.length, plan.removableTrackIds.length),
+          removedCount: plan.source.trackIds.length - expectedSourceIds.length,
           totalCount: plan.removableTrackIds.length,
         })
         if (offset + BATCH_SIZE < plan.removableTrackIds.length) {
@@ -195,7 +206,7 @@ export async function executePlaylistCleanup(
     } catch (err) {
       failure = err instanceof Error ? err.message : '清理请求失败，已停止后续写入'
     }
-    return await readCleanupResult(plan, failure)
+    return await readCleanupResult(plan, expectedSourceIds, failedTracks, failure)
   } finally {
     cleanupRunning = false
   }

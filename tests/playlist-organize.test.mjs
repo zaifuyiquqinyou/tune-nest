@@ -2,11 +2,12 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import ts from 'typescript'
+import * as jsxRuntime from 'react/jsx-runtime'
 
 // 执行真实源码，所有账号、歌单写入、AI 和存储均由测试替身接管。
 function loadSource(path, imports = {}) {
   const compiled = ts.transpileModule(readFileSync(new URL('../' + path, import.meta.url), 'utf8'), {
-    fileName: path, compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
+    fileName: path, compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, jsx: ts.JsxEmit.ReactJSX },
   }).outputText
   const module = { exports: {} }
   new Function('require', 'module', 'exports', compiled)((name) => {
@@ -20,7 +21,10 @@ const rules = loadSource('src/classifier/playlist-organizer.ts')
 const ai = loadSource('src/classifier/organize-ai.ts')
 const preferences = loadSource('src/utils/organize-preferences.ts', { '@/classifier/playlist-organizer': rules })
 const api = loadSource('src/api/netease-direct.ts')
+const mutations = loadSource('src/services/playlist-track-mutation.ts', { '@/api/netease-direct': api })
+const drafts = loadSource('src/utils/organize-draft.ts')
 const service = loadSource('src/services/playlist-organize.ts', {
+  '@/services/playlist-track-mutation': mutations,
   '@/api/netease-direct': api, '@/classifier/playlist-organizer': rules,
 })
 const USER = 7, SOURCE = 101, B = 202, C = 203, COLLECTED = 303
@@ -231,6 +235,258 @@ test('arbitrary playlist names cannot read inherited work aliases', () => {
   }
 })
 
+// 参考歌曲分布在多个专辑，便于区分稳定偏好和仅一张专辑的偶然重合。
+const artistHistory = (count, offset = 10, artist = '歌手甲') => Array.from({ length: count }, (_, index) =>
+  song(offset + index, { artists: [artist], album: '历史专辑' + index % 3 }))
+const defaultIds = (recommendation) => recommendation.candidates.filter((candidate) => candidate.defaultSelected)
+  .map((candidate) => candidate.playlistId)
+const newArtistSong = () => song(1, { artists: ['歌手甲'], album: '新专辑' })
+
+test('strong artist history leads weak options and selection does not depend on playlist input order', () => {
+  const weak = profile(B, '日系', artistHistory(2, 100))
+  const strong = profile(C, '古风', artistHistory(11))
+  const first = recommend(newArtistSong(), [weak, strong])
+  const reversed = recommend(newArtistSong(), [strong, weak])
+  assert.deepEqual(first, reversed)
+  assert.equal(first.candidates[0].playlistId, C)
+  assert.ok(first.candidates[0].score >= 75)
+  assert.equal(first.candidates[0].certain, false)
+  assert.deepEqual(defaultIds(first), [C])
+  assert.match(first.selectionReason, /领先次选/)
+  assert.ok(Object.isFrozen(first.candidates[0]))
+})
+
+test('equal or closely ranked strong destinations stay unchecked even if one is first', () => {
+  const history = artistHistory(10)
+  for (const other of [history, history.slice(0, 9)]) {
+    const result = recommend(newArtistSong(), [profile(B, '古风', history), profile(C, '日系', other)])
+    assert.ok(result.candidates[0].score >= 75)
+    assert.deepEqual(defaultIds(result), [])
+    assert.match(result.selectionReason, /推荐分接近/)
+  }
+})
+
+test('a lone candidate still needs enough samples and diverse releases', () => {
+  for (const history of [artistHistory(2), artistHistory(7), artistHistory(10).map((track) => ({ ...track, album: '唯一专辑' }))]) {
+    const result = recommend(newArtistSong(), [profile(B, '古风', history)])
+    assert.equal(result.candidates.length, 1)
+    assert.deepEqual(defaultIds(result), [])
+  }
+  assert.deepEqual(defaultIds(recommend(newArtistSong(), [profile(B, '古风', artistHistory(8))])), [B])
+})
+
+test('artist-only evidence must cover every credited collaborator rather than a single guest', () => {
+  const result = recommend(song(1, { artists: ['歌手甲', '歌手乙'], album: '新专辑' }),
+    [profile(B, '古风', [...artistHistory(10), ...artistHistory(1, 100, '歌手乙')])])
+  assert.ok(result.candidates[0].score >= 75)
+  assert.deepEqual(defaultIds(result), [])
+})
+
+test('shared songs across target playlists are counted once in reference concentration', () => {
+  const history = artistHistory(10)
+  const result = recommend(newArtistSong(), [profile(B, '古风', history), profile(C, '日系', history.slice(0, 8))])
+  assert.equal(result.candidates[0].score, 85)
+  assert.equal(result.candidates[1].score, 68)
+  assert.deepEqual(defaultIds(result), [B])
+})
+
+test('strong album history can suggest a newcomer without requiring the same artist', () => {
+  const history = Array.from({ length: 4 }, (_, index) => song(index + 10, { artists: ['歌手' + index], album: '共同专辑' }))
+  const result = recommend(song(1, { artists: ['新人'], album: '共同专辑' }), [profile(B, 'ACG', history)])
+  assert.deepEqual(defaultIds(result), [B])
+  assert.equal(result.candidates[0].certain, false)
+  assert.match(result.candidates[0].reason, /同专辑/)
+})
+
+test('work history connects different albums without assuming the current song is an existing ID', () => {
+  const history = Array.from({ length: 4 }, (_, index) => song(index + 10, { artists: ['演奏者' + index], album: '古剑奇谭 作品集' + index }))
+  const result = recommend(song(1, { artists: ['新人'], album: '古剑奇谭 新录音' }), [profile(B, 'ACG', history)])
+  assert.deepEqual(defaultIds(result), [B])
+  assert.equal(result.candidates[0].certain, false)
+  assert.match(result.candidates[0].reason, /同作品/)
+})
+
+test('an explicit soundtrack title connects original and translated suffixes for the same work', () => {
+  const history = Array.from({ length: 4 }, (_, index) => song(index + 10, { artists: ['演奏者' + index], album: '天行九歌 OST' }))
+  const result = recommend(song(1, { artists: ['新人'], album: '天行九歌 原声音乐' }), [profile(B, 'ACG', history)])
+  assert.deepEqual(defaultIds(result), [B])
+  assert.match(result.candidates[0].reason, /同作品/)
+})
+
+test('album and work evidence do not count the same two samples twice to force a selection', () => {
+  const history = [song(10, { artists: ['甲'], album: '古剑奇谭 OST' }), song(11, { artists: ['乙'], album: '古剑奇谭 OST' })]
+  const result = recommend(song(1, { artists: ['新人'], album: '古剑奇谭 OST' }), [profile(B, 'ACG', history)])
+  assert.ok(result.candidates[0].score < 75)
+  assert.deepEqual(defaultIds(result), [])
+})
+
+test('corroborating artist and album history may select one clear target with three distinct songs', () => {
+  const history = artistHistory(3).map((track) => ({ ...track, album: '共同专辑' }))
+  const result = recommend(song(1, { artists: ['歌手甲'], album: '共同专辑' }), [profile(B, 'ACG', history)])
+  assert.deepEqual(defaultIds(result), [B])
+  assert.match(result.candidates[0].reason, /同歌手.*同专辑/)
+})
+
+test('generic collections and generic artist names never produce strong album or artist defaults', () => {
+  for (const album of ['热门精选', '原声', '专辑', 'Best compilation', 'Generic original soundtrack']) {
+    const history = artistHistory(10).map((track) => ({ ...track, artists: ['群星'], album }))
+    const result = recommend(song(1, { artists: ['群星'], album }), [profile(B, 'ACG', history)])
+    assert.deepEqual(defaultIds(result), [])
+  }
+})
+
+test('other versions remain unchecked despite a strong statistical lead', () => {
+  const history = [...artistHistory(10), song(100, { name: '歌曲1', artists: ['歌手甲'], album: '新专辑' })]
+  const result = recommend(newArtistSong(), [profile(B, '古风', history)])
+  assert.ok(result.candidates[0].score >= 75)
+  assert.deepEqual(defaultIds(result), [])
+  assert.match(result.warning, /不同 ID/)
+})
+
+test('personal destinations, unsupported vocal language and unrelated works remain manual', () => {
+  for (const name of ['曾经的歌', '最烦了', '最近', '英语', 'eng', '韩语', '剑网三']) {
+    const result = recommend(newArtistSong(), [profile(B, name, artistHistory(10))])
+    assert.equal(result.candidates.length, 1)
+    assert.ok(result.candidates[0].score <= 50)
+    assert.deepEqual(defaultIds(result), [])
+  }
+})
+
+test('collaborations do not auto-select a playlist dedicated to another credited artist', () => {
+  const history = artistHistory(10).map((track) => ({ ...track, artists: ['歌手甲', '玄觞'] }))
+  const result = recommend(newArtistSong(), [profile(B, '玄觞', history)])
+  assert.deepEqual(defaultIds(result), [])
+  assert.match(result.candidates[0].reason, /其他歌手/)
+})
+
+test('explicit rules override inference restrictions and preserve all clear destinations', () => {
+  const result = recommend(newArtistSong(), [profile(B, '古风', artistHistory(10)), profile(C, '最近'), profile(204, '歌手甲')],
+    [{ id: 'manual', kind: 'artist', value: '歌手甲', targetPlaylistId: C }])
+  assert.deepEqual(defaultIds(result), [C, 204])
+  assert.ok(result.candidates.filter((candidate) => candidate.certain).every((candidate) => candidate.defaultSelected))
+  assert.equal(result.candidates.find((candidate) => candidate.playlistId === B).defaultSelected, false)
+})
+
+test('missing reference details or incomplete member lists cannot create an artificial strong lead', () => {
+  const strong = profile(B, '古风', artistHistory(10))
+  const missing = profile(C, 'ACG', artistHistory(20, 100).map((track) => ({ ...track, detailsAvailable: false, name: '' })))
+  assert.deepEqual(defaultIds(recommend(newArtistSong(), [strong, missing])), [])
+  const incomplete = { ...strong, snapshot: { ...strong.snapshot, reportedTrackCount: 100 } }
+  assert.deepEqual(defaultIds(recommend(newArtistSong(), [incomplete])), [])
+  const exact = profile(204, '已有', [newArtistSong()])
+  assert.deepEqual(defaultIds(recommend(newArtistSong(), [strong, missing, exact])), [204])
+})
+
+test('duplicate names or repeated IDs do not manufacture enough independent history', () => {
+  const repeated = artistHistory(10).map((track) => ({ ...track, name: '同一录音' }))
+  assert.deepEqual(defaultIds(recommend(newArtistSong(), [profile(B, '古风', repeated)])), [])
+  assert.deepEqual(defaultIds(recommend(newArtistSong(), [profile(B, '古风', Array(10).fill(song(10, { artists: ['歌手甲'] })))])), [])
+})
+
+test('inferred preview stays readonly and only checked defaults move after target verification', async (t) => {
+  const history = artistHistory(10)
+  const state = fixture(t, { source: [1, 2], b: history.map((track) => track.id), c: [100, 101] })
+  const details = new Map([newArtistSong(), song(2, { artists: ['独立歌手'], album: '其他专辑' }),
+    ...history, song(100, { artists: ['其他人'] }), song(101, { artists: ['其他人'] })].map((track) => [track.id, track]))
+  state.onSongs = (ids) => ({ code: 200, songs: ids.map((id) => {
+    const track = details.get(id)
+    return { id, name: track.name, ar: track.artists.map((name) => ({ name })), al: { name: track.album }, dt: track.durationMs }
+  }) })
+  const plan = await preview()
+  assert.equal(state.writes.length, 0)
+  const selected = plan.recommendations.map((recommendation) => ({ songId: recommendation.songId, targetPlaylistIds: defaultIds(recommendation) }))
+    .filter((item) => item.targetPlaylistIds.length)
+  assert.deepEqual(selected, [assignment(1, [B])])
+  const result = await service.executePlaylistOrganize(plan, selected, true)
+  assert.equal(result.status, 'completed')
+  assert.deepEqual(state.playlists.get(SOURCE).trackIds, [2])
+  assert.deepEqual(state.playlists.get(C).trackIds, [100, 101])
+  assert.ok(state.playlists.get(B).trackIds.includes(1))
+  assert.ok(state.events.slice(0, state.events.findIndex((event) => event.kind === 'write' && event.op === 'del'))
+    .some((event) => event.kind === 'write' && event.pid === B && event.op === 'add'))
+})
+
+test('page preview checks inferred defaults, displays reasons and preserves manual and AI choices', async (t) => {
+  const strong = profile(B, '古风', artistHistory(10))
+  const other = profile(C, 'ACG')
+  const tracks = [newArtistSong(), song(2, { artists: ['没有参考的歌手'], album: '无关联专辑' })]
+  const plan = {
+    userId: USER, scope: include, source: profile(SOURCE, '未分类', tracks).snapshot,
+    tracks, targets: [strong.snapshot, other.snapshot], warnings: [],
+    recommendations: rules.recommendExistingPlaylists(tracks, [strong, other]),
+    aiTargets: [strong, other].map((p) => ({ id: p.snapshot.id, name: p.snapshot.name, examples: [] })),
+  }
+  const settings = { version: 1, sourceId: SOURCE, mode: 'include', includedIds: [B, C], excludedIds: [], rules: [], decisions: [] }
+  const states = []
+  const refs = []
+  let cursor = 0, refCursor = 0, writes = 0, savedChoices = []
+  // 用轻量状态容器执行真实页面回调和 JSX，账号接口仍由测试替身接管。
+  const page = loadSource('src/panel/pages/PlaylistOrganize.tsx', {
+    'react/jsx-runtime': jsxRuntime,
+    react: {
+      useEffect: () => {}, useRef: (initial) => {
+        const index = refCursor++
+        return refs[index] ||= { current: index === 0 ? USER : initial }
+      },
+      useState: (initial) => {
+        const index = cursor++
+        if (!(index in states)) states[index] = index === 1 ? settings : initial
+        return [states[index], (next) => { states[index] = typeof next === 'function' ? next(states[index]) : next }]
+      },
+    },
+    '@/classifier/playlist-organizer': rules,
+    '@/classifier/organize-ai': ai,
+    '@/services/playlist-organize': { previewPlaylistOrganize: async () => plan, executePlaylistOrganize: async () => { writes++; throw new Error('模拟请求中断') } },
+    '@/utils/organize-preferences': { saveOrganizePreferences: async () => {}, loadOrganizePreferences: async () => settings },
+    '@/utils/organize-draft': { ...drafts, loadOrganizeDraft: async () => savedChoices, saveOrganizeDraft: async (_uid, _source, choices) => { savedChoices = structuredClone(choices) } },
+    '../components/PlaylistFailures': { PlaylistFailures: () => null },
+    '../hooks/use-playlist-tools': {
+      usePlaylistList: () => ({ playlists: [playlist(SOURCE, '未分类'), playlist(B, '古风'), playlist(C, 'ACG')], loading: false, error: null, reload: () => {} }),
+      usePlaylistOperation: () => ({ busy: false, busyRef: { current: false }, setError: () => {}, run: (work) => work() }),
+    },
+  })
+  const render = () => { cursor = 0; refCursor = 0; return page.PlaylistOrganize({ uid: USER, onBack: () => {}, onBusyChange: () => {} }) }
+  const nodes = (element) => Array.isArray(element) ? element.flatMap(nodes)
+    : element && typeof element === 'object' && element.props ? [element, ...nodes(element.props.children)] : []
+  const textOf = (element) => Array.isArray(element) ? element.map(textOf).join('')
+    : element && typeof element === 'object' ? textOf(element.props?.children) : element == null ? '' : String(element)
+  const findButton = (tree, label) => nodes(tree).find((node) => node.type === 'button' && textOf(node).includes(label))
+  const card = (tree, id) => nodes(tree).find((node) => node.type === 'div' && node.key === String(id))
+  const checkboxes = (tree, id) => nodes(card(tree, id)).filter((node) => node.type === 'input' && node.props.type === 'checkbox')
+  await findButton(render(), '分析并预览归档建议').props.onClick()
+  let tree = render()
+  assert.equal(checkboxes(tree, 1)[0].props.checked, true)
+  assert.match(textOf(card(tree, 1)), /首选建议.*推荐分/)
+  assert.match(textOf(card(tree, 1)), /分析结论/)
+  assert.equal(writes, 0)
+  const oldChrome = globalThis.chrome
+  t.after(() => { if (oldChrome === undefined) delete globalThis.chrome; else globalThis.chrome = oldChrome })
+  globalThis.chrome = { runtime: { sendMessage: async () => ({ success: true, data: [{ songId: 2, targetPlaylistIds: [C], reason: '待确认的关联' }] }) } }
+  await findButton(tree, 'AI 补充未选歌曲').props.onClick()
+  tree = render()
+  assert.equal(checkboxes(tree, 1)[0].props.checked, true)
+  assert.equal(checkboxes(tree, 2)[0].props.checked, false)
+  checkboxes(tree, 1)[0].props.onChange()
+  assert.equal(checkboxes(render(), 1)[0].props.checked, false)
+  checkboxes(render(), 2)[0].props.onChange()
+  assert.equal(checkboxes(render(), 2)[0].props.checked, true)
+  findButton(card(render(), 2), '保留原地').props.onClick()
+  assert.equal(checkboxes(render(), 2)[0].props.checked, false)
+  assert.equal(writes, 0)
+  checkboxes(render(), 2)[0].props.onChange()
+  await assert.rejects(findButton(render(), '确认归档并从来源移除').props.onClick(), /模拟请求中断/)
+  assert.equal(writes, 1)
+  assert.deepEqual(savedChoices, [assignment(1, []), assignment(2, [C])])
+  await findButton(render(), '分析并预览归档建议').props.onClick()
+  assert.equal(checkboxes(render(), 1)[0].props.checked, false, 'Explicit leave-in-place must survive preview')
+  assert.equal(checkboxes(render(), 2)[0].props.checked, true, 'Manual destination must survive execution failure')
+  states.length = 0
+  refs.length = 0
+  await findButton(render(), '分析并预览归档建议').props.onClick()
+  assert.equal(checkboxes(render(), 1)[0].props.checked, false)
+  assert.equal(checkboxes(render(), 2)[0].props.checked, true, 'Saved choice must survive page remount')
+})
+
 test('preview is readonly, frozen and uses actual IDs despite statistical mismatch', async (t) => {
   const state = fixture(t)
   state.counts.set(SOURCE, 99)
@@ -240,6 +496,115 @@ test('preview is readonly, frozen and uses actual IDs despite statistical mismat
   assert.equal(plan.tracks.length, 4)
   assert.equal(plan.warnings.length, 1)
   assert.equal(plan.recommendations.find((item) => item.songId === 2).candidates.find((item) => item.playlistId === B).certain, true)
+})
+
+function organizePageFixture(t, count) {
+  const tracks = Array.from({ length: count }, (_, i) => song(i + 1))
+  const state = { plan: {
+    userId: USER, source: profile(SOURCE, '未分类', tracks).snapshot, tracks,
+    targets: [profile(B, 'ACG').snapshot, profile(C, '日系').snapshot], scope: include, warnings: [],
+    recommendations: tracks.map((track) => ({ songId: track.id, candidates: [], selectionReason: '等待手工确认' })),
+    aiTargets: [{ id: B, name: 'ACG', examples: [] }],
+  }, execute: null, onAI: null, storage: {} }
+  const settings = { version: 1, sourceId: SOURCE, mode: 'include', includedIds: [B, C], excludedIds: [], rules: [], decisions: [] }
+  const oldChrome = globalThis.chrome
+  globalThis.chrome = { storage: { local: {
+    get: async (key) => ({ [key]: structuredClone(state.storage[key]) }),
+    set: async (values) => Object.assign(state.storage, structuredClone(values)),
+  } }, runtime: { sendMessage: async (input) => state.onAI(input) } }
+  t.after(() => { globalThis.chrome = oldChrome })
+  const states = [], refs = []
+  let cursor = 0, refCursor = 0
+  const page = loadSource('src/panel/pages/PlaylistOrganize.tsx', {
+    'react/jsx-runtime': jsxRuntime,
+    react: {
+      useEffect: () => {}, useRef: (initial) => {
+        const index = refCursor++
+        return refs[index] ||= { current: index === 0 ? USER : initial }
+      },
+      useState: (initial) => {
+        const index = cursor++
+        if (!(index in states)) states[index] = index === 1 ? settings : initial
+        return [states[index], (next) => { states[index] = typeof next === 'function' ? next(states[index]) : next }]
+      },
+    },
+    '@/classifier/playlist-organizer': rules, '@/classifier/organize-ai': ai,
+    '@/services/playlist-organize': { previewPlaylistOrganize: async () => state.plan, executePlaylistOrganize: (...args) => state.execute(...args) },
+    '@/utils/organize-preferences': { loadOrganizePreferences: async () => settings, saveOrganizePreferences: async () => {} },
+    '@/utils/organize-draft': drafts, '../components/PlaylistFailures': { PlaylistFailures: () => null },
+    '../hooks/use-playlist-tools': {
+      usePlaylistList: () => ({ playlists: [playlist(SOURCE, '未分类'), playlist(B, 'ACG'), playlist(C, '日系')], loading: false, error: null, reload: () => {} }),
+      usePlaylistOperation: () => ({ busy: false, busyRef: { current: false }, setError: () => {}, run: (work) => work() }),
+    },
+  })
+  const render = () => { cursor = 0; refCursor = 0; return page.PlaylistOrganize({ uid: USER, onBack: () => {}, onBusyChange: () => {} }) }
+  const nodes = (element) => Array.isArray(element) ? element.flatMap(nodes)
+    : element && typeof element === 'object' && element.props ? [element, ...nodes(element.props.children)] : []
+  const textOf = (element) => Array.isArray(element) ? element.map(textOf).join('')
+    : element && typeof element === 'object' ? textOf(element.props?.children) : element == null ? '' : String(element)
+  state.click = (label) => nodes(render()).find((node) => node.type === 'button' && textOf(node).includes(label)).props.onClick()
+  state.choose = (songId, targetId) => nodes(render()).find((node) => node.type === 'select' && node.props['aria-label'] === '为歌曲 ' + songId + ' 添加归档去向')
+    .props.onChange({ target: { value: String(targetId) } })
+  state.card = (songId) => nodes(render()).find((node) => node.type === 'div' && node.key === String(songId))
+  state.checked = (songId) => nodes(state.card(songId)).filter((node) => node.type === 'input' && node.props.type === 'checkbox' && node.props.checked).length
+  state.text = () => textOf(render())
+  state.reload = () => { states.length = 0; refs.length = 0 }
+  return state
+}
+
+test('partial execution persists 125 choices and only clears verified completed songs', async (t) => {
+  const page = organizePageFixture(t, 125)
+  await page.click('分析并预览归档建议')
+  for (let id = 1; id <= 124; id++) page.choose(id, B)
+  page.execute = async (_preview, assignments) => {
+    assert.equal(assignments.length, 124)
+    assert.equal((await drafts.loadOrganizeDraft(USER, SOURCE)).length, 125, 'Save choices before the first write')
+    return { status: 'partial', completedSongIds: Array.from({ length: 123 }, (_, i) => i + 1),
+      failedTracks: [{ songId: 124, playlistId: B, operation: 'add', message: '下架' }], targets: [],
+      message: '跳过 1 首', removedCount: 123, sourceRemainingCount: 2, leftUntouchedCount: 1, sourceVerified: true }
+  }
+  await page.click('确认归档并从来源移除')
+  const pending = await drafts.loadOrganizeDraft(USER, SOURCE)
+  assert.deepEqual(pending.find((item) => item.songId === 124).targetPlaylistIds, [B])
+  assert.ok(pending.filter((item) => item.songId !== 124).every((item) => item.targetPlaylistIds.length === 0))
+  page.plan = { ...page.plan, tracks: page.plan.tracks.slice(123),
+    source: { ...page.plan.source, trackIds: [124, 125] }, recommendations: page.plan.recommendations.slice(123) }
+  page.reload()
+  await page.click('分析并预览归档建议')
+  assert.equal(page.checked(124), 1)
+  assert.equal(page.checked(125), 0)
+  assert.equal(page.card(1), undefined)
+})
+
+test('AI batch failure preserves manual choices, continues later songs and exposes failed IDs', async (t) => {
+  const page = organizePageFixture(t, 22)
+  await page.click('分析并预览归档建议')
+  page.choose(22, C)
+  const requests = []
+  page.onAI = ({ data }) => {
+    requests.push(data.songs.map((song) => song.id))
+    return requests.length === 1 ? { success: false, error: '本批 JSON 无效' } : {
+      success: true, data: data.songs.map((song) => ({ songId: song.id, targetPlaylistIds: [B], reason: '待确认建议' })),
+    }
+  }
+  await page.click('AI 补充未选歌曲')
+  assert.deepEqual(requests.map((ids) => ids.length), [10, 10, 1])
+  assert.equal(page.checked(22), 1)
+  assert.equal(page.checked(21), 0)
+  assert.match(page.text(), /有 10 首未获得 AI 建议/)
+  assert.match(page.text(), /ID 1：本批 JSON 无效/)
+})
+
+test('AI authentication failure does not repeatedly request remaining batches or clear selections', async (t) => {
+  const page = organizePageFixture(t, 22)
+  await page.click('分析并预览归档建议')
+  page.choose(22, C)
+  let calls = 0
+  page.onAI = () => { calls++; return { success: false, error: 'DeepSeek 请求失败（HTTP 401）' } }
+  await page.click('AI 补充未选歌曲')
+  assert.equal(calls, 1)
+  assert.equal(page.checked(22), 1)
+  assert.match(page.text(), /有 21 首未获得 AI 建议/)
 })
 
 test('preview missing details retains IDs and does not force suggestions', async (t) => {
@@ -287,6 +652,101 @@ test('copy-only preserves full source and manual assignments are permitted only 
   noDeletes(state)
 })
 
+test('205-song multi-target move skips a delisted song in a later batch and completes all other songs', async (t) => {
+  const ids = Array.from({ length: 205 }, (_, i) => i + 1)
+  const state = fixture(t, { source: [...ids, 999], b: [700, 701], c: [800, 801] })
+  state.onWrite = (write) => write.op === 'add' && write.pid === C && write.trackIds.includes(117)
+    ? { code: 512, message: '下架歌曲无法收藏。' } : undefined
+  const result = await service.executePlaylistOrganize(await preview(), ids.map((id) => assignment(id)), true)
+  assert.equal(result.status, 'partial')
+  assert.deepEqual(state.playlists.get(SOURCE).trackIds, [117, 999])
+  assert.equal(result.completedSongIds.length, 204)
+  assert.equal(result.removedCount, 204)
+  assert.deepEqual(result.failedTracks.map((item) => [item.songId, item.playlistId, item.operation]), [[117, C, 'add']])
+  assert.ok(state.playlists.get(B).trackIds.includes(117), 'Successful destination must retain this song')
+  assert.ok(!state.playlists.get(C).trackIds.includes(117))
+  assert.deepEqual(state.playlists.get(B).trackIds.filter((id) => id >= 700), [700, 701])
+  assert.deepEqual(state.playlists.get(C).trackIds.filter((id) => id >= 700), [800, 801])
+  assert.ok(result.targets.every((target) => target.verified && target.originalPreserved))
+  const successfulWrites = state.writes.filter((write) => write.op === 'add' && !(write.pid === C && write.trackIds.includes(117)))
+  for (const pid of [B, C]) {
+    const added = successfulWrites.filter((write) => write.pid === pid).flatMap((write) => write.trackIds)
+    assert.equal(new Set(added).size, added.length, 'Verified additions must not be resubmitted')
+  }
+})
+
+test('song-specific source deletion failure leaves that song and continues the remaining batches', async (t) => {
+  const ids = Array.from({ length: 105 }, (_, i) => i + 1)
+  const state = fixture(t, { source: ids, b: ids, c: ids })
+  state.onWrite = (write) => write.op === 'del' && write.trackIds.includes(50)
+    ? { code: 512, message: '该歌曲无法移除' } : undefined
+  const result = await service.executePlaylistOrganize(await preview(), ids.map((id) => assignment(id)), true)
+  assert.equal(result.status, 'partial')
+  assert.deepEqual(state.playlists.get(SOURCE).trackIds, [50])
+  assert.equal(result.removedCount, 104)
+  assert.deepEqual(result.failedTracks.map((item) => [item.songId, item.operation]), [[50, 'remove']])
+  assert.deepEqual(state.playlists.get(B).trackIds, ids)
+  assert.deepEqual(state.playlists.get(C).trackIds, ids)
+})
+
+test('business rejection after partial application never retries confirmed additions', async (t) => {
+  const state = fixture(t, { source: [1, 2, 3, 4], b: [], c: [] })
+  state.onWrite = (write) => {
+    if (write.op === 'add' && write.trackIds.includes(2)) {
+      state.apply({ ...write, trackIds: write.trackIds.filter((id) => id !== 2) })
+      return { code: 512, message: '下架歌曲无法收藏' }
+    }
+  }
+  const result = await service.executePlaylistOrganize(await preview(), [1, 2, 3, 4].map((id) => assignment(id, [B])), true)
+  assert.equal(result.status, 'partial')
+  assert.deepEqual(state.playlists.get(SOURCE).trackIds, [2])
+  assert.equal(state.writes.filter((write) => write.op === 'add').length, 1)
+  assert.deepEqual(result.failedTracks.map((item) => item.songId), [2])
+})
+
+test('a delisted message does not hide account, permission, rate-limit or unknown failures', async (t) => {
+  const state = fixture(t)
+  for (const response of [
+    { code: 301, message: '下架歌曲无法收藏，请登录' },
+    { code: 403, message: '下架歌曲无法收藏' },
+    { code: 429, message: '下架歌曲无法收藏，请求频繁' },
+    { code: 500, message: '未知错误' },
+  ]) {
+    state.writes.length = 0
+    state.onWrite = () => response
+    const result = await service.executePlaylistOrganize(await preview(), [assignment(1), assignment(3)], true)
+    assert.equal(result.status, 'stopped')
+    assert.equal(state.writes.length, 1)
+    assert.deepEqual(result.failedTracks, [])
+    noDeletes(state)
+  }
+})
+
+test('draft restores over 100 choices and explicit empty selections, filters stale IDs and isolates accounts', async (t) => {
+  const oldChrome = globalThis.chrome
+  const storage = {}
+  globalThis.chrome = { storage: { local: {
+    get: async (key) => ({ [key]: structuredClone(storage[key]) }),
+    set: async (values) => Object.assign(storage, structuredClone(values)),
+  } } }
+  t.after(() => { globalThis.chrome = oldChrome })
+  const choices = Array.from({ length: 125 }, (_, i) => assignment(i + 1, i === 50 ? [] : [B, C]))
+  await drafts.saveOrganizeDraft(USER, SOURCE, choices)
+  assert.deepEqual(await drafts.loadOrganizeDraft(USER, SOURCE), choices)
+  assert.deepEqual(await drafts.loadOrganizeDraft(88, SOURCE), [])
+  assert.deepEqual(await drafts.loadOrganizeDraft(USER, C), [])
+  const remaining = choices.slice(1).map((item) => item.songId).concat(500)
+  const plan = { targets: [{ id: B }], recommendations: remaining.map((songId) => ({ songId, candidates: [
+    { playlistId: B, defaultSelected: true },
+  ] })) }
+  const restored = drafts.restoreOrganizeChoices(plan, await drafts.loadOrganizeDraft(USER, SOURCE))
+  assert.equal(Object.keys(restored).length, 125)
+  assert.equal(restored[1], undefined)
+  assert.deepEqual(restored[2], [B])
+  assert.deepEqual(restored[51], [])
+  assert.deepEqual(restored[500], [B])
+})
+
 test('song already present in all selected targets is removed only from source', async (t) => {
   const state = fixture(t, { b: [1, 9], c: [1, 8] })
   const result = await service.executePlaylistOrganize(await preview(), [assignment(1)], true)
@@ -306,14 +766,16 @@ test('failure at a later target preserves entire source and successful earlier a
   assert.equal(state.writes.length, 2)
 })
 
-test('partial success response cannot permit source removal', async (t) => {
+test('partial addition removes only songs confirmed in all targets and retains failed songs', async (t) => {
   const state = fixture(t)
   state.onWrite = (write) => {
     if (write.pid === C) { state.apply({ ...write, trackIds: [1] }); return { code: 200 } }
   }
   const result = await service.executePlaylistOrganize(await preview(), [assignment(1), assignment(3)], true)
-  assert.equal(result.status, 'stopped')
-  noDeletes(state)
+  assert.equal(result.status, 'partial')
+  assert.deepEqual(state.playlists.get(SOURCE).trackIds, [2, 3, 4])
+  assert.deepEqual(result.completedSongIds, [1])
+  assert.deepEqual(result.failedTracks.map((item) => item.songId), [3])
   assert.equal(result.targets.find((target) => target.id === C).missingCount, 1)
 })
 

@@ -111,9 +111,161 @@ function certainMetadataReason(song: PlaylistTextTrack, targetName: string): str
   return null
 }
 
+// 推断推荐需同时满足最低强度和领先差距；明确 ID、个人规则等不受此阈值限制。
+const inferredScoreThreshold = 75
+const inferredScoreMargin = 15
+
+interface IndexedOrganizeTrack {
+  readonly track: PlaylistTextTrack
+  readonly name: string
+  readonly artists: readonly string[]
+  readonly album: string
+  readonly works: readonly string[]
+}
+
+interface OrganizeEvidence {
+  readonly profile: OrganizeProfile
+  readonly artists: readonly IndexedOrganizeTrack[]
+  readonly albums: readonly IndexedOrganizeTrack[]
+  readonly works: readonly IndexedOrganizeTrack[]
+  readonly versions: readonly IndexedOrganizeTrack[]
+}
+
+/** 只使用明确作品别名或有原声后缀的专辑名，通用“原声”“合集”等不能成为作品依据。 */
+function identifyOrganizeWorks(song: PlaylistTextTrack): string[] {
+  const text = normalize(song.name + ' ' + song.album)
+  const works = Object.entries(workAliases).filter(([, aliases]) => aliases.some((alias) => matchesWork(text, alias)))
+    .map(([name]) => normalize(name))
+  const match = normalize(song.album).match(/^(.+?)[\s·:：-]+(?:原声(?:音乐|带|专辑)|original soundtrack|ost)(?:\s|$)/i)
+  const title = match?.[1].replace(/^[《「]|[》」]$/g, '').trim()
+  if (title && title.length >= 3 && !/原声|合集|精选|热门|群星|compilation|best/i.test(title) &&
+      !/^(generic|original|游戏|动画|电影|电视剧|影视|音乐)$/i.test(title)) works.push(title)
+  return [...new Set(works)]
+}
+
+function indexOrganizeTrack(track: PlaylistTextTrack): IndexedOrganizeTrack {
+  const usable = track.detailsAvailable && !!track.name.trim()
+  const album = normalize(track.album)
+  return {
+    track, name: usable ? normalize(track.name) : '',
+    artists: usable ? [...new Set(track.artists.map(normalize).filter((name) => name && !genericArtists.has(name)))].sort() : [],
+    album: usable && album && !/热门|合集|精选|best|compilation/i.test(album) &&
+      !/^(专辑|原声|原声音乐|原声带|原创|翻唱|单曲|single|unknown|untitled|(?:generic )?(?:original )?soundtrack|ost|オリジナルサウンドトラック)$/i.test(album) ? album : '',
+    works: usable ? identifyOrganizeWorks(track) : [],
+  }
+}
+
+/** 推断不能把合作歌手混入他人的专属歌单，也不能推测个人回忆、语种或不相符的作品。 */
+function inferredTargetRestriction(
+  name: string, song: IndexedOrganizeTrack, knownArtists: ReadonlySet<string>, knownWorks: ReadonlySet<string>
+): string | null {
+  const target = normalize(name)
+  const artistAliases = target === '初音' ? ['初音ミク', 'hatsune miku']
+    : target === '泽野弘之' ? ['泽野弘之', '澤野弘之'] : knownArtists.has(target) ? [target] : []
+  if (artistAliases.length && !artistAliases.some((artist) => song.artists.includes(artist))) {
+    return '歌单对应其他歌手，合作演唱关联仅供参考'
+  }
+  if (knownWorks.has(target) && !song.works.includes(target)) return '尚无该作品的明确标记，需手工确认'
+  if (/最近|未分类|待分类|喜欢|收藏|收纳|曾经|回忆|最烦|心情|^她$|^生而为人$/.test(target)) {
+    return '个人收纳、回忆或心情类歌单需手工确认'
+  }
+  if (/^(华语|中文|国语|粤语|英语|英文|eng|english|日语|日文|japanese|韩语|韩文|korean)$/i.test(target)) {
+    return '未取得演唱语种依据，需手工确认'
+  }
+  return null
+}
+
 /**
- * 按本人目标歌单推荐多个去向：相同 ID、明确作品/歌手及用户规则可默认选择。
- * 同歌手、同专辑及同名异 ID 仅显示待确认建议；没有依据时返回空去向，绝不强制兜底。
+ * 从允许目标建立一次索引；跨歌单重复歌曲只计一次，缺失详情按可能落在其他目标估算。
+ * 歌手依据同时看样本数量和归类集中度，专辑与作品取较强一项，避免同一来源重复加分。
+ */
+function createOrganizeAffinityReader(profiles: readonly OrganizeProfile[]) {
+  const tracks = new Map<number, IndexedOrganizeTrack>()
+  for (const profile of profiles) for (const track of profile.tracks) {
+    if (!tracks.has(track.id)) tracks.set(track.id, indexOrganizeTrack(track))
+  }
+  const knownArtists = new Set([...tracks.values()].flatMap((track) => [...track.artists]))
+  const knownWorks = new Set([...Object.keys(workAliases).map(normalize), ...[...tracks.values()].flatMap((track) => [...track.works])])
+  const unknownCount = [...tracks.values()].filter((track) => !track.name).length +
+    profiles.reduce((count, profile) => count + Math.max(0, profile.snapshot.reportedTrackCount - profile.snapshot.trackIds.length), 0)
+  const indexed = profiles.map((profile) => ({
+    profile, tracks: [...new Set(profile.snapshot.trackIds)].map((id) => tracks.get(id)).filter((track): track is IndexedOrganizeTrack => !!track),
+  }))
+  return (song: PlaylistTextTrack) => {
+    const source = indexOrganizeTrack(song)
+    const evidence: OrganizeEvidence[] = indexed.map(({ profile, tracks: members }) => {
+      const peers = members.filter((track) => track.track.id !== song.id && !!track.name)
+      return {
+        profile,
+        artists: peers.filter((track) => track.artists.some((artist) => source.artists.includes(artist))),
+        albums: peers.filter((track) => source.album && track.album === source.album),
+        works: peers.filter((track) => track.works.some((work) => source.works.includes(work))),
+        versions: peers.filter((track) => source.artists.length > 0 && track.name === source.name &&
+          JSON.stringify(track.artists) === JSON.stringify(source.artists)),
+      }
+    })
+    const total = (kind: 'artists' | 'albums' | 'works') =>
+      new Set(evidence.flatMap((item) => item[kind].map((track) => track.track.id))).size + unknownCount
+    const totals = { artists: total('artists'), albums: total('albums'), works: total('works') }
+    return evidence.map((item) => {
+      const artistCount = item.artists.length, albumCount = item.albums.length, workCount = item.works.length
+      const artistShare = artistCount / Math.max(1, totals.artists)
+      const albumShare = albumCount / Math.max(1, totals.albums)
+      const workShare = workCount / Math.max(1, totals.works)
+      const artistScore = artistCount >= 2 ? 40 * Math.min(artistCount / 10, 1) + 45 * artistShare : 0
+      const albumScore = albumCount >= 2 ? 45 * Math.min(albumCount / 4, 1) + 40 * albumShare : 0
+      const workScore = workCount >= 2 ? 45 * Math.min(workCount / 4, 1) + 40 * workShare : 0
+      const corroborated = artistCount >= 3 && (albumCount >= 2 && albumShare >= 0.75 || workCount >= 2 && workShare >= 0.75)
+      const reasons: string[] = []
+      if (artistCount >= 2) reasons.push('已有 ' + artistCount + ' 首同歌手歌曲')
+      if (albumCount >= 2) reasons.push('已有 ' + albumCount + ' 首同专辑歌曲')
+      if (workCount >= 2) reasons.push('已有 ' + workCount + ' 首同作品歌曲')
+      if (item.versions.length) reasons.push('已有同名同歌手的其他 ID（' +
+        item.versions.slice(0, 3).map((track) => track.track.id).join('、') + '），需确认版本')
+      const restriction = inferredTargetRestriction(item.profile.snapshot.name, source, knownArtists, knownWorks)
+      if (restriction && reasons.length) reasons.push(restriction)
+      const score = Math.min(restriction ? 50 : 95, Math.round(Math.max(artistScore, albumScore, workScore,
+        item.versions.length ? 40 : 0) + (corroborated ? 10 : 0)))
+      const diverseArtistHistory = artistCount >= 8 && artistShare >= 0.8 &&
+        new Set(item.artists.map((track) => track.album).filter(Boolean)).size >= 3 &&
+        source.artists.every((artist) => item.artists.filter((track) => track.artists.includes(artist)).length >= 2)
+      const releaseHistory = albumCount >= 4 && albumShare >= 0.75 || workCount >= 4 && workShare >= 0.75
+      const distinctSongs = new Set([...item.artists, ...item.albums, ...item.works].map((track) => track.name)).size
+      return {
+        playlistId: item.profile.snapshot.id, score, reason: reasons.join('；'), hasOtherVersion: item.versions.length > 0,
+        eligible: !restriction && distinctSongs >= 3 && (diverseArtistHistory || releaseHistory || corroborated),
+      }
+    })
+  }
+}
+
+/** 明确去向可多选；其余只在首选样本充分、达到阈值且明显领先时默认选择一个。 */
+function selectOrganizeDefaults(
+  candidates: OrganizeCandidate[], eligible: ReadonlySet<number>, hasOtherVersion: boolean
+): { candidates: readonly OrganizeCandidate[]; selectionReason: string } {
+  candidates.sort((a, b) => Number(b.certain) - Number(a.certain) || (b.score ?? 0) - (a.score ?? 0) || a.playlistId - b.playlistId)
+  const certainCount = candidates.filter((candidate) => candidate.certain).length
+  const first = candidates[0]
+  const lead = (first?.score ?? 0) - (candidates[1]?.score ?? 0)
+  let selectionReason = '没有足够的归类依据，保留原地'
+  if (certainCount) selectionReason = '分析时按明确依据默认勾选 ' + certainCount + ' 个去向，可逐首调整'
+  else if (hasOtherVersion) selectionReason = '存在同名不同 ID 的版本，去向需手工确认'
+  else if (first) {
+    if ((first.score ?? 0) < inferredScoreThreshold || !eligible.has(first.playlistId)) {
+      selectionReason = '首选的参考样本或归类依据仍不足，暂不默认勾选'
+    } else if (lead < inferredScoreMargin) {
+      selectionReason = '前两项推荐分接近（' + first.score + ' / ' + candidates[1].score + '），暂不默认勾选'
+    } else {
+      candidates[0] = { ...first, defaultSelected: true }
+      selectionReason = '首选依据较强' + (candidates.length > 1 ? '，领先次选 ' + lead + ' 分' : '') + '，分析时默认勾选；可自行调整'
+    }
+  }
+  return { candidates: Object.freeze(candidates.map((candidate) => Object.freeze(candidate))), selectionReason }
+}
+
+/**
+ * 按本人目标歌单推荐多个去向：相同 ID、明确作品/歌手及用户规则可默认多选。
+ * 其余候选按作品、专辑和歌手归类记录排序，仅默认选择充分且领先的首选；弱依据不强制归档。
  */
 export function recommendExistingPlaylists(
   songs: readonly PlaylistTextTrack[],
@@ -124,45 +276,39 @@ export function recommendExistingPlaylists(
   validateOrganizeRules(rules)
   const allowedIds = new Set(profiles.map((profile) => profile.snapshot.id))
   const ruleLabels = { artist: '歌手', album: '专辑', text: '关键词' }
+  const readAffinities = createOrganizeAffinityReader(profiles)
   return songs.map((song) => {
     const candidates = new Map<number, OrganizeCandidate>()
-    let hasOtherVersion = false
-    const add = (playlistId: number, certain: boolean, reason: string) => {
-      if (!allowedIds.has(playlistId)) return
-      const previous = candidates.get(playlistId)
-      if (!previous || certain && !previous.certain) candidates.set(playlistId, { playlistId, certain, reason })
+    const affinities = song.detailsAvailable && song.name ? readAffinities(song) : []
+    const hasOtherVersion = affinities.some((affinity) => affinity.hasOtherVersion)
+    const addCertain = (playlistId: number, reason: string) => {
+      if (!allowedIds.has(playlistId) || candidates.get(playlistId)?.certain) return
+      candidates.set(playlistId, { playlistId, certain: true, reason, score: 100, defaultSelected: true })
     }
     for (const target of decisions.find((decision) => decision.songId === song.id)?.targetPlaylistIds || []) {
-      add(target, true, '沿用你此前确认并成功归档的同一歌曲 ID')
+      addCertain(target, '沿用你此前确认并成功归档的同一歌曲 ID')
     }
     for (const profile of profiles) {
       const targetId = profile.snapshot.id
-      if (profile.snapshot.trackIds.includes(song.id)) add(targetId, true, '相同歌曲 ID 已存在于该歌单')
+      if (profile.snapshot.trackIds.includes(song.id)) addCertain(targetId, '相同歌曲 ID 已存在于该歌单')
       if (!song.detailsAvailable || !song.name) continue
       for (const rule of rules) {
         if (rule.targetPlaylistId === targetId && matchesRule(song, rule)) {
-          add(targetId, true, '命中你保存的' + ruleLabels[rule.kind] + '规则：「' + rule.value + '」')
+          addCertain(targetId, '命中你保存的' + ruleLabels[rule.kind] + '规则：「' + rule.value + '」')
         }
       }
       const metadataReason = certainMetadataReason(song, profile.snapshot.name)
-      if (metadataReason) add(targetId, true, metadataReason)
-      const variants = profile.tracks.filter((track) => track.id !== song.id && normalize(track.name) === normalize(song.name) &&
-        JSON.stringify(track.artists.map(normalize).sort()) === JSON.stringify(song.artists.map(normalize).sort()))
-      if (variants.length > 0) {
-        hasOtherVersion = true
-        add(targetId, false, '已有同名同歌手的其他 ID（' + variants.slice(0, 3).map((track) => track.id).join('、') + '），需确认版本')
-      }
-      const peers = profile.tracks.filter((track) => track.id !== song.id && track.artists.some((artist) =>
-        !genericArtists.has(normalize(artist)) && song.artists.some((name) => normalize(name) === normalize(artist))))
-      if (peers.length >= 2) add(targetId, false, '已有 ' + peers.length + ' 首同歌手歌曲，仅作个人偏好参考')
-      if (song.album && !/热门|合集|精选|best|compilation/i.test(song.album)) {
-        const albumPeers = profile.tracks.filter((track) => track.id !== song.id && normalize(track.album) === normalize(song.album))
-        if (albumPeers.length >= 2) add(targetId, false, '已有 ' + albumPeers.length + ' 首同专辑歌曲，作品归属仍需确认')
-      }
+      if (metadataReason) addCertain(targetId, metadataReason)
     }
+    for (const affinity of affinities) {
+      if (affinity.reason && !candidates.has(affinity.playlistId)) candidates.set(affinity.playlistId, {
+        playlistId: affinity.playlistId, certain: false, reason: affinity.reason, score: affinity.score, defaultSelected: false,
+      })
+    }
+    const defaults = selectOrganizeDefaults([...candidates.values()],
+      new Set(affinities.filter((affinity) => affinity.eligible).map((affinity) => affinity.playlistId)), hasOtherVersion)
     return Object.freeze({
-      songId: song.id,
-      candidates: Object.freeze([...candidates.values()].sort((a, b) => Number(b.certain) - Number(a.certain))),
+      songId: song.id, ...defaults,
       warning: !song.detailsAvailable ? '未取得歌曲详情；除同一 ID 的已确认归档外，请保留原地或手工确认'
         : hasOtherVersion ? '同名不同 ID 可能是不同录音或版本，不按歌名合并或移除' : null,
     })

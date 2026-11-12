@@ -22,7 +22,10 @@ function loadSource(relativePath, imports = {}) {
 }
 
 const api = loadSource('src/api/netease-direct.ts')
-const cleanup = loadSource('src/services/playlist-cleanup.ts', { '@/api/netease-direct': api })
+const mutations = loadSource('src/services/playlist-track-mutation.ts', { '@/api/netease-direct': api })
+const cleanup = loadSource('src/services/playlist-cleanup.ts', {
+  '@/api/netease-direct': api, '@/services/playlist-track-mutation': mutations,
+})
 const USER = 7
 const SOURCE = 101
 const REFERENCE = 202
@@ -162,6 +165,21 @@ test('disjoint playlists produce no mutation requests', async (t) => {
   assert.equal(outcome.removedCount, 0)
   assert.equal(state.writes.length, 0)
   assert.deepEqual(state.playlists.get(SOURCE).trackIds, [1, 2])
+  assertReferenceUnchanged(state)
+})
+
+test('cleanup skips a song-specific deletion rejection and continues beyond 100 songs without touching B', async (t) => {
+  const ids = Array.from({ length: 103 }, (_, i) => i + 1)
+  const state = fixture(t, { sourceIds: [...ids, 999], referenceIds: ids })
+  state.onDelete = (write) => write.trackIds.includes(88) ? { code: 512, message: '该歌曲无法删除' } : undefined
+  const progress = []
+  const outcome = await cleanup.executePlaylistCleanup(await preview(), (item) => progress.push(item))
+  assert.equal(outcome.status, 'partial')
+  assert.deepEqual(state.playlists.get(SOURCE).trackIds, [88, 999])
+  assert.equal(outcome.sourceVerified, true)
+  assert.equal(outcome.removedCount, 102)
+  assert.deepEqual(outcome.failedTracks.map((item) => item.songId), [88])
+  assert.equal(progress.at(-1).removedCount, 102)
   assertReferenceUnchanged(state)
 })
 
@@ -317,7 +335,8 @@ test('partial server-side deletion is detected even with a successful business r
     return { code: 200 }
   }
   const outcome = await cleanup.executePlaylistCleanup(await preview())
-  assert.equal(outcome.status, 'stopped')
+  assert.equal(outcome.status, 'partial')
+  assert.deepEqual(outcome.failedTracks.map((item) => item.songId), [3])
   assert.equal(outcome.removedCount, 1)
   assert.equal(outcome.pendingCount, 1)
   assert.equal(state.writes.length, 1)

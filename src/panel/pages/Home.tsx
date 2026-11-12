@@ -12,6 +12,12 @@ interface Props {
 export function Home({ onNavigate }: Props) {
   const features: FeatureItem[] = [
     {
+      icon: '↕️',
+      title: '歌单内歌曲排序',
+      desc: '按加入时间、平台热度或本人听歌排行重排已有歌曲',
+      action: () => onNavigate('sort'),
+    },
+    {
       icon: '🗂️',
       title: '整理到已有歌单',
       desc: '按已有分类归档到多个歌单，不确定的歌曲保留原地',

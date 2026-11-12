@@ -3,6 +3,8 @@ import { defaultOrganizeExclusions } from '@/classifier/playlist-organizer'
 import { validateOrganizeAIOutput } from '@/classifier/organize-ai'
 import { executePlaylistOrganize, previewPlaylistOrganize } from '@/services/playlist-organize'
 import { loadOrganizePreferences, saveOrganizePreferences } from '@/utils/organize-preferences'
+import { loadOrganizeDraft, restoreOrganizeChoices, saveOrganizeDraft } from '@/utils/organize-draft'
+import { PlaylistFailures } from '../components/PlaylistFailures'
 import { usePlaylistList, usePlaylistOperation } from '../hooks/use-playlist-tools'
 import type { ExtensionResponse } from '@/types'
 import type {
@@ -20,11 +22,13 @@ const buttonClass = 'tn-btn disabled:opacity-50 disabled:cursor-not-allowed'
 const fieldClass = 'w-full rounded-lg border border-gray-200 p-2 text-sm bg-white'
 const ruleNames = { artist: '歌手完全匹配', album: '专辑完全匹配', text: '歌名或专辑包含关键词' }
 
-/** 独立保存两种勾选模式；预览只默认选择明确依据，AI 及模糊建议始终等待手工勾选。 */
+/** 预览保留明确去向的多选，并默认选择依据充分且领先的推断首选；AI 建议仍需手工确认。 */
 export function PlaylistOrganize({ uid, onBack, onBusyChange }: Props) {
   const list = usePlaylistList(uid)
   const operation = usePlaylistOperation(onBusyChange)
   const initializedUser = useRef<number | null>(null)
+  const selectionSource = useRef<number | null>(null)
+  const [keepChoices, setKeepChoices] = useState(true)
   const [preferences, setPreferences] = useState<OrganizePreferences | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [preview, setPreview] = useState<PlaylistOrganizePreview | null>(null)
@@ -38,6 +42,7 @@ export function PlaylistOrganize({ uid, onBack, onBusyChange }: Props) {
   const [ruleKind, setRuleKind] = useState<OrganizeRule['kind']>('artist')
   const [ruleValue, setRuleValue] = useState('')
   const [ruleTarget, setRuleTarget] = useState('')
+  const [aiErrors, setAIErrors] = useState<{ songId: number; name: string; message: string }[]>([])
   const owned = list.playlists.filter((playlist) => playlist.creator.userId === uid)
   const ready = initializedUser.current === uid && !!preferences
   const disabled = operation.busy || list.loading || !!list.error || !ready
@@ -61,6 +66,9 @@ export function PlaylistOrganize({ uid, onBack, onBusyChange }: Props) {
       }
       if (!active) return
       initializedUser.current = uid
+      selectionSource.current = null
+      setSelected({})
+      setPreview(null)
       setPreferences(saved || {
         version: 1, sourceId: sourceMatches.length === 1 ? sourceMatches[0].id : null,
         mode: 'include', includedIds: [], excludedIds: defaultOrganizeExclusions(ownedPlaylists),
@@ -74,8 +82,8 @@ export function PlaylistOrganize({ uid, onBack, onBusyChange }: Props) {
 
   const resetPreview = () => {
     setPreview(null)
-    setSelected({})
     setAICandidates({})
+    setAIErrors([])
     setOutcome(null)
     setProgress(null)
     operation.setError(null)
@@ -83,6 +91,10 @@ export function PlaylistOrganize({ uid, onBack, onBusyChange }: Props) {
 
   const changePreferences = (patch: Partial<OrganizePreferences>) => {
     if (operation.busyRef.current || !preferences) return
+    if (patch.sourceId !== undefined && patch.sourceId !== preferences.sourceId) {
+      selectionSource.current = null
+      setSelected({})
+    }
     setPreferences({ ...preferences, ...patch })
     resetPreview()
   }
@@ -108,15 +120,24 @@ export function PlaylistOrganize({ uid, onBack, onBusyChange }: Props) {
     resetPreview()
     const next = await previewPlaylistOrganize(uid, preferences.sourceId,
       { mode: preferences.mode, playlistIds: scopeIds }, preferences.rules, preferences.decisions, setProgress)
-    const initial: Record<number, number[]> = {}
-    for (const recommendation of next.recommendations) {
-      initial[recommendation.songId] = recommendation.candidates.filter((candidate) => candidate.certain).map((candidate) => candidate.playlistId)
+    let saved: readonly OrganizeAssignment[] = []
+    if (keepChoices) {
+      if (selectionSource.current === next.source.id) {
+        saved = Object.entries(selected).map(([id, targets]) => ({ songId: Number(id), targetPlaylistIds: targets }))
+      } else {
+        try { saved = await loadOrganizeDraft(uid, next.source.id) } catch (err) {
+          setNotice('上次勾选读取失败：' + (err instanceof Error ? err.message : '存储失败'))
+        }
+      }
     }
-    setSelected(initial)
+    setSelected(restoreOrganizeChoices(next, saved))
+    selectionSource.current = next.source.id
     setPreview(next)
     setFilter('all')
     setProgress(null)
-    await persist(preferences)
+    try { await saveOrganizePreferences(uid, preferences) } catch {
+      setNotice('归档设置未保存；当前勾选仍可使用')
+    }
   })
 
   const toggleDestination = (songId: number, targetId: number) => {
@@ -140,45 +161,73 @@ export function PlaylistOrganize({ uid, onBack, onBusyChange }: Props) {
   /** AI 仅补充未选歌曲的待确认候选，绝不修改已经勾选的去向。 */
   const handleAI = () => operation.run(async () => {
     if (!preview) return
+    setAIErrors([])
+    const failures: { songId: number; name: string; message: string }[] = []
     for (let offset = 0; offset < pendingAI.length; offset += 10) {
       const input = { songs: pendingAI.slice(offset, offset + 10), targets: preview.aiTargets }
-      const response = await chrome.runtime.sendMessage({
-        action: 'SUGGEST_EXISTING_PLAYLISTS', data: input,
-      }) as ExtensionResponse
-      if (!response?.success) throw new Error(response?.error || 'AI 建议读取失败，当前选择和来源歌曲保留')
-      const suggestions = validateOrganizeAIOutput(response.data, input)
-      setAICandidates((previous) => {
-        const next = { ...previous }
-        for (const suggestion of suggestions) {
-          next[suggestion.songId] = suggestion.targetPlaylistIds.map((playlistId) => ({
-            playlistId, certain: false, reason: 'AI 待确认：' + suggestion.reason,
-          }))
+      try {
+        const response = await chrome.runtime.sendMessage({
+          action: 'SUGGEST_EXISTING_PLAYLISTS', data: input,
+        }) as ExtensionResponse
+        if (!response?.success) throw new Error(response?.error || 'AI 建议读取失败')
+        const suggestions = validateOrganizeAIOutput(response.data, input)
+        setAICandidates((previous) => {
+          const next = { ...previous }
+          for (const suggestion of suggestions) {
+            next[suggestion.songId] = suggestion.targetPlaylistIds.map((playlistId) => ({
+              playlistId, certain: false, reason: 'AI 待确认：' + suggestion.reason, score: null, defaultSelected: false,
+            }))
+          }
+          return next
+        })
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'AI 建议读取失败'
+        // 配置和服务限制影响所有批次，不反复请求；已有建议和手工选择仍然保留。
+        const unavailable = /API Key|HTTP (?:400|401|402|403|429)|已在插件设置中关闭|AI 建议输入无效/.test(message)
+        for (const song of unavailable ? pendingAI.slice(offset) : input.songs) {
+          failures.push({ songId: song.id, name: song.name, message })
         }
-        return next
-      })
+        setAIErrors([...failures])
+        if (unavailable) break
+      }
       setProgress({ phase: 'ai', completed: Math.min(offset + 10, pendingAI.length), total: pendingAI.length })
     }
   })
 
-  /** 仅在全部目标和来源核验成功后记录同 ID 的个人去向；失败后必须重新预览。 */
+  /** 执行前保存勾选；仅记录已核验完成的去向，未完成歌曲重新预览时恢复原选择。 */
   const handleExecute = () => operation.run(async () => {
     if (!preview || !preferences) return
     setExecuting(true)
     setProgress(null)
     setOutcome(null)
+    const choices = preview.tracks.map((track) => ({ songId: track.id, targetPlaylistIds: selected[track.id] || [] }))
+    const saveChoices = async (pending: readonly OrganizeAssignment[]) => {
+      try {
+        await saveOrganizeDraft(uid, preview.source.id, pending)
+        setNotice('勾选已保存在本机；重新分析时可恢复未完成歌曲的去向')
+      } catch {
+        setNotice('勾选暂未保存到本机，请保留当前页面；重新分析仍会保留当前勾选')
+      }
+    }
     try {
+      await saveChoices(choices)
       const next = await executePlaylistOrganize(preview, assignments, move, setProgress)
       setOutcome(next)
-      if (next.status === 'completed') {
+      const completed = new Set(next.completedSongIds)
+      const pending = choices.map((item) => completed.has(item.songId) ? { ...item, targetPlaylistIds: [] } : item)
+      setSelected(Object.fromEntries(pending.map((item) => [item.songId, [...item.targetPlaylistIds]])))
+      if (completed.size > 0) {
         const decisions = new Map(preferences.decisions.map((decision) => [decision.songId, decision]))
-        for (const assignment of assignments) decisions.set(assignment.songId, assignment)
+        for (const assignment of assignments) {
+          if (completed.has(assignment.songId)) decisions.set(assignment.songId, assignment)
+        }
         const saved = { ...preferences, decisions: [...decisions.values()].slice(-5000) }
         setPreferences(saved)
         await persist(saved)
       }
+      await saveChoices(pending)
     } finally {
       setPreview(null)
-      setSelected({})
       setAICandidates({})
       setExecuting(false)
       list.reload()
@@ -191,7 +240,7 @@ export function PlaylistOrganize({ uid, onBack, onBusyChange }: Props) {
   return (
     <div>
       <h3 className="text-lg font-bold text-gray-800 mb-2">整理到已有歌单</h3>
-      <p className="text-xs text-gray-500 mb-4">一首歌可归档到多个已有歌单。不确定的建议默认不勾选，继续保留在来源。</p>
+      <p className="text-xs text-gray-500 mb-4">一首歌可归档到多个已有歌单。明确依据或充分领先的首选默认勾选，其余保留在来源等待确认。</p>
       {(list.loading || !ready && !list.error) && <p className="text-sm text-gray-500">正在读取歌单和本机设置...</p>}
       {list.error && <p role="alert" className="text-sm text-red-600">{list.error}</p>}
       <button className={buttonClass + ' tn-btn-secondary w-full mb-3'} disabled={operation.busy || list.loading}
@@ -263,6 +312,10 @@ export function PlaylistOrganize({ uid, onBack, onBusyChange }: Props) {
           <button className={buttonClass + ' tn-btn-secondary w-full mb-2'} disabled={disabled}
             onClick={() => operation.run(() => persist(preferences))}>保存范围和个人规则</button>
           {notice && <p role="status" className="text-xs text-amber-700 mb-3">{notice}</p>}
+          <label className="flex items-center gap-2 text-xs mb-3">
+            <input type="checkbox" checked={keepChoices} disabled={disabled} onChange={(event) => setKeepChoices(event.target.checked)} />
+            重新分析时保留上次勾选（包括“保留原地”）
+          </label>
           <button className={buttonClass + ' tn-btn-primary w-full'} disabled={disabled || !preferences.sourceId || eligible.length === 0}
             onClick={handlePreview}>分析并预览归档建议</button>
         </>
@@ -280,10 +333,15 @@ export function PlaylistOrganize({ uid, onBack, onBusyChange }: Props) {
             <p className="mt-1 break-words">{preview.targets.map((target) => target.name + '（' + target.id + '）').join('、')}</p>
           </details>
           {preview.warnings.map((warning) => <p key={warning} className="text-xs text-amber-700 mt-2">{warning}</p>)}
-          <p className="text-xs text-gray-500 mt-3">相同 ID、明确作品／歌手及个人规则默认勾选；同名异 ID、相似偏好和 AI 建议需手工勾选。请核对每首歌的全部去向。</p>
+          <p className="text-xs text-gray-500 mt-3">明确依据可默认多选；其余按推荐强度排序，样本充分、达到 75 分且领先次选至少 15 分时默认选首项。推荐分用于比较候选，不代表正确率；AI 建议仍需手工勾选。</p>
           <button className={buttonClass + ' tn-btn-secondary w-full mt-3'} disabled={operation.busy || pendingAI.length === 0}
             onClick={handleAI}>AI 补充未选歌曲的建议（需手工勾选）</button>
           <p className="text-xs text-gray-400 mt-1">可选：向已配置的 DeepSeek 发送待确认歌曲及允许目标的名称、样例。没有 API Key 也可使用本地规则和手工确认。</p>
+          {aiErrors.length > 0 && <details className="text-xs text-amber-700 mt-2" open>
+            <summary>有 {aiErrors.length} 首未获得 AI 建议，当前勾选和来源歌曲保留</summary>
+            <ul className="mt-2 max-h-48 overflow-y-auto space-y-1">{aiErrors.map((item) =>
+              <li key={item.songId}>{item.name} · ID {item.songId}：{item.message}</li>)}</ul>
+          </details>}
           <label className="block text-xs mt-3">筛选预览
             <select className={fieldClass + ' mt-1'} value={filter} disabled={operation.busy}
               onChange={(event) => setFilter(event.target.value as typeof filter)}>
@@ -298,19 +356,23 @@ export function PlaylistOrganize({ uid, onBack, onBusyChange }: Props) {
                 if (!candidates.has(candidate.playlistId)) candidates.set(candidate.playlistId, candidate)
               }
               for (const targetId of selected[track.id] || []) {
-                if (!candidates.has(targetId)) candidates.set(targetId, { playlistId: targetId, certain: false, reason: '手工指定' })
+                if (!candidates.has(targetId)) candidates.set(targetId, { playlistId: targetId, certain: false, reason: '手工指定', score: null, defaultSelected: false })
               }
               return (
                 <div key={track.id} className="rounded-xl border border-gray-200 p-3">
                   <p className="text-sm font-semibold break-words">{track.name || '详情不可用'} <span className="font-normal text-xs text-gray-400">ID {track.id}</span></p>
                   <p className="text-xs text-gray-500 mt-1 break-words">{track.artists.join(' / ')}{track.album && ' · ' + track.album}</p>
                   {recommendation.warning && <p className="text-xs text-amber-700 mt-1">{recommendation.warning}</p>}
+                  <p className="text-xs text-gray-500 mt-1">分析结论：{recommendation.selectionReason}</p>
                   {[...candidates.values()].map((candidate) => (
                     <label key={candidate.playlistId} className="flex items-start gap-2 mt-2 text-xs">
                       <input type="checkbox" className="mt-0.5" disabled={operation.busy}
                         checked={selected[track.id]?.includes(candidate.playlistId) || false}
                         onChange={() => toggleDestination(track.id, candidate.playlistId)} />
                       <span><span className="font-semibold">{preview.targets.find((target) => target.id === candidate.playlistId)?.name} · ID {candidate.playlistId}</span>
+                        {candidate.score !== null && <span className="block text-blue-700 mt-0.5">
+                          {candidate.certain ? '明确依据' : candidate.defaultSelected ? '首选建议' : '待确认'} · 推荐分 {candidate.score}
+                        </span>}
                         <span className="block text-gray-500 mt-0.5">{candidate.reason}</span></span>
                     </label>
                   ))}
@@ -334,7 +396,7 @@ export function PlaylistOrganize({ uid, onBack, onBusyChange }: Props) {
             <span>全部选定目标核验成功后，从来源移除<span className="block text-xs text-gray-500 mt-1">取消则仅复制，来源歌曲保留。</span></span>
           </label>
           <p className="text-sm font-semibold mt-3">将{move ? '归档并移除' : '复制'} {assignments.length} 首；{preview.tracks.length - assignments.length} 首不参与，保留原地。</p>
-          <p className="text-xs text-amber-700 mt-2">执行期间请勿在其他页面或客户端修改相关歌单。所有目标均补齐前不会移除来源，失败后需重新预览。</p>
+          <p className="text-xs text-amber-700 mt-2">单首失败会跳过并汇总，该歌保留在来源；只有该歌全部选定目标确认成功才移除。请勿同时修改相关歌单。重新分析会保留未完成歌曲的勾选。</p>
           <button className={buttonClass + ' tn-btn-primary w-full mt-3'} disabled={operation.busy || assignments.length === 0}
             onClick={handleExecute}>确认{move ? '归档并从来源移除' : '仅复制'} {assignments.length} 首</button>
         </div>
@@ -343,6 +405,7 @@ export function PlaylistOrganize({ uid, onBack, onBusyChange }: Props) {
       {outcome && (
         <div role="status" className={'rounded-xl p-3 mt-4 text-sm ' + (outcome.status === 'completed' ? 'bg-green-50 text-green-800' : 'bg-amber-50 text-amber-800')}>
           <p className="font-semibold">{outcome.message}</p>
+          <PlaylistFailures failures={outcome.failedTracks} />
           <p className="text-xs mt-2">来源已移除 {outcome.removedCount ?? '未知'} 首，当前读取剩余 {outcome.sourceRemainingCount ?? '未知'} 首；{outcome.leftUntouchedCount} 首未参与。</p>
           <p className="text-xs mt-1">来源其余内容及顺序：{outcome.sourceVerified === true ? '核验通过' : outcome.sourceVerified === false ? '检测到其他变化' : '未能核验'}。</p>
           {outcome.targets.map((target) => <p key={target.id} className="text-xs mt-2 break-words">

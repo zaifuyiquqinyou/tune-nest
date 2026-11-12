@@ -22,6 +22,7 @@ function loadSource(path, imports = {}) {
 }
 
 const api = loadSource('src/api/netease-direct.ts')
+const mutations = loadSource('src/services/playlist-track-mutation.ts', { '@/api/netease-direct': api })
 const textTools = loadSource('src/utils/playlist-text.ts')
 const zipTools = loadSource('src/utils/playlist-zip.ts')
 const fileTools = loadSource('src/utils/playlist-files.ts', { './playlist-zip': zipTools })
@@ -29,6 +30,7 @@ const exporter = loadSource('src/services/playlist-export.ts', {
   '@/api/netease-direct': api, '@/utils/playlist-text': textTools,
 })
 const merger = loadSource('src/services/playlist-merge.ts', {
+  '@/services/playlist-track-mutation': mutations,
   '@/api/netease-direct': api, '@/utils/playlist-text': textTools,
 })
 const USER = 7
@@ -416,6 +418,31 @@ test('copy-only online merge leaves all source songs unchanged', async (t) => {
   assert.deepEqual(state.playlists.get(B).trackIds, [3, 4, 5])
 })
 
+test('delisted song is retained in every source while all other songs are merged', async (t) => {
+  const state = fixture(t)
+  state.onWrite = (write) => write.op === 'add' && write.trackIds.includes(3)
+    ? { code: 512, message: '下架歌曲无法收藏' } : undefined
+  const outcome = await merger.executePlaylistMerge(await previewOnline())
+  assert.equal(outcome.status, 'partial')
+  assert.deepEqual(state.playlists.get(A).trackIds, [3])
+  assert.deepEqual(state.playlists.get(B).trackIds, [3])
+  assert.deepEqual(outcome.failedTracks.map((item) => item.songId), [3])
+  assert.equal(outcome.targetPreserved, true)
+  assert.ok(outcome.sources.every((source) => source.verified))
+})
+
+test('single-song removal rejection in one source does not block the next source', async (t) => {
+  const state = fixture(t)
+  state.onWrite = (write) => write.op === 'del' && write.pid === A && write.trackIds.includes(2)
+    ? { code: 512, message: '该歌曲无法移除' } : undefined
+  const outcome = await merger.executePlaylistMerge(await previewOnline())
+  assert.equal(outcome.status, 'partial')
+  assert.deepEqual(state.playlists.get(A).trackIds, [2])
+  assert.deepEqual(state.playlists.get(B).trackIds, [])
+  assert.deepEqual(outcome.failedTracks.map((item) => [item.playlistId, item.songId]), [[A, 2]])
+  assert.equal(outcome.targetPreserved, true)
+})
+
 test('role, ownership and duplicate-source errors are rejected without any writes', async (t) => {
   const state = fixture(t)
   await assert.rejects(previewOnline([A, TARGET]), /目标歌单/)
@@ -452,18 +479,21 @@ test('target business failure leaves every source intact', async (t) => {
   assert.deepEqual(state.playlists.get(A).trackIds, [1, 2, 3])
 })
 
-test('partial target addition with a success response stops before any source deletion', async (t) => {
+test('partial target addition moves confirmed songs and reports all unadded songs', async (t) => {
   const state = fixture(t)
   state.onWrite = (write) => {
-    state.apply({ ...write, trackIds: write.trackIds.slice(0, 1) })
-    return { code: 200 }
+    if (write.op === 'add') {
+      state.apply({ ...write, trackIds: write.trackIds.slice(0, 1) })
+      return { code: 200 }
+    }
   }
   const outcome = await merger.executePlaylistMerge(await previewOnline())
-  assert.equal(outcome.status, 'stopped')
+  assert.equal(outcome.status, 'partial')
   assert.equal(outcome.addedCount, 1)
   assert.equal(outcome.missingTargetCount, 3)
-  noDeletes(state)
-  assert.deepEqual(state.playlists.get(A).trackIds, [1, 2, 3])
+  assert.deepEqual(state.playlists.get(A).trackIds, [3])
+  assert.deepEqual(state.playlists.get(B).trackIds, [3, 4, 5])
+  assert.deepEqual(outcome.failedTracks.map((item) => item.songId), [3, 4, 5])
 })
 
 test('lost add response is not retried; a fresh preview can safely resume moving', async (t) => {
@@ -528,7 +558,7 @@ test('lost delete response reports observed removals and never retries the write
   assert.equal(outcome.targetPreserved, true)
 })
 
-test('partial deletion is detected and the next source is untouched', async (t) => {
+test('partial deletion is reported and the next source is still processed', async (t) => {
   const state = fixture(t)
   state.onWrite = (write) => {
     if (write.op === 'del') {
@@ -537,10 +567,11 @@ test('partial deletion is detected and the next source is untouched', async (t) 
     }
   }
   const outcome = await merger.executePlaylistMerge(await previewOnline())
-  assert.equal(outcome.status, 'stopped')
+  assert.equal(outcome.status, 'partial')
   assert.equal(outcome.sources[0].removedCount, 1)
   assert.equal(outcome.sources[0].pendingCount, 2)
-  assert.deepEqual(state.playlists.get(B).trackIds, [3, 4, 5])
+  assert.deepEqual(state.playlists.get(B).trackIds, [4, 5])
+  assert.deepEqual(outcome.failedTracks.map((item) => [item.playlistId, item.songId]), [[A, 2], [A, 3], [B, 4], [B, 5]])
 })
 
 test('source change during additions prevents every source deletion', async (t) => {

@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "test:cleanup": "node --test tests/playlist-cleanup.test.mjs",
-    "test:playlists": "node --test tests/playlist-cleanup.test.mjs tests/playlist-tools.test.mjs tests/playlist-organize.test.mjs",
+    "test:playlists": "node --test tests/playlist-cleanup.test.mjs tests/playlist-tools.test.mjs tests/playlist-organize.test.mjs tests/playlist-sort.test.mjs tests/playlist-populate.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

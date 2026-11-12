@@ -1,4 +1,5 @@
 import type { PlaylistSnapshot } from './playlist-cleanup'
+import type { PlaylistOperationStatus, PlaylistTrackFailure } from './playlist-operation'
 import type { PlaylistTextTrack } from './playlist-tools'
 
 /** include 只接收勾选目标；exclude 接收未被排除的本人歌单，来源始终排除。 */
@@ -33,12 +34,16 @@ export interface OrganizeCandidate {
   readonly playlistId: number
   readonly certain: boolean
   readonly reason: string
+  /** 本地推荐强度用于比较候选，不代表正确率；AI 和手工去向没有本地分数。 */
+  readonly score: number | null
+  readonly defaultSelected: boolean
 }
 
 export interface OrganizeRecommendation {
   readonly songId: number
   readonly candidates: readonly OrganizeCandidate[]
   readonly warning: string | null
+  readonly selectionReason: string
 }
 
 export interface OrganizeProfile {
@@ -93,8 +98,10 @@ export interface OrganizeTargetResult {
 
 /** 数量来自重新读取的 ID；无法核验的字段保留 null。 */
 export interface PlaylistOrganizeResult {
-  status: 'completed' | 'stopped'
+  status: PlaylistOperationStatus
+  failedTracks: readonly PlaylistTrackFailure[]
   message: string
+  completedSongIds: readonly number[]
   selectedCount: number
   leftUntouchedCount: number
   removedCount: number | null

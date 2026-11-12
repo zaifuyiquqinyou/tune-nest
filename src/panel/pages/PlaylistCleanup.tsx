@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { getCleanupPlaylists, getSongDetailsDirect } from '@/api/netease-direct'
 import { executePlaylistCleanup, previewPlaylistCleanup } from '@/services/playlist-cleanup'
+import { PlaylistFailures } from '../components/PlaylistFailures'
 import type { Playlist, Song } from '@/types'
 import type {
   PlaylistCleanupPlan,
@@ -105,7 +106,7 @@ export function PlaylistCleanup({ uid, onBack, onBusyChange }: Props) {
           if (matchedIds.has(song.id)) details.set(song.id, song)
         }
       } catch {
-        break
+        // 名称读取失败不改变待清理的 ID，后续批次继续补充详情。
       }
     }
     setSongDetails(details)
@@ -264,8 +265,9 @@ export function PlaylistCleanup({ uid, onBack, onBusyChange }: Props) {
             : 'border-amber-200 bg-amber-50 text-amber-900')}
           role="status"
         >
-          <p className="font-semibold mb-2">{outcome.status === 'completed' ? '清理完成并通过核验' : '操作已停止，请核对结果'}</p>
+          <p className="font-semibold mb-2">{outcome.status === 'completed' ? '清理完成并通过核验' : outcome.status === 'partial' ? '清理结束，部分歌曲已跳过' : '操作已停止，请核对结果'}</p>
           <p className="break-words">{outcome.message}</p>
+          <PlaylistFailures failures={outcome.failedTracks} songName={(id) => songDetails.get(id)?.name} />
           <p className="mt-2">本次读取结果中已不再出现的重复歌曲：{outcome.removedCount ?? '待核验'}</p>
           <p>A 当前可读取：{outcome.remainingTrackCount ?? '待核验'} 首</p>
           <p>本次重复歌曲仍留在 A：{outcome.pendingCount ?? '待核验'} 首</p>

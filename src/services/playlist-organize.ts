@@ -6,6 +6,8 @@ import {
   isOrganizeTargetAllowed, recommendExistingPlaylists, resolveOrganizeTargets,
   validateOrganizeRules, validateOrganizeScope,
 } from '@/classifier/playlist-organizer'
+import { mutatePlaylistTracks } from '@/services/playlist-track-mutation'
+import type { PlaylistTrackFailure } from '@/types/playlist-operation'
 import type { PlaylistSnapshot } from '@/types/playlist-cleanup'
 import type { PlaylistTextTrack } from '@/types/playlist-tools'
 import type {
@@ -164,34 +166,25 @@ async function assertSnapshot(original: PlaylistSnapshot, expectedIds: readonly 
   }
 }
 
-async function assertAllTargets(plan: ExecutionPlan, expected: ReadonlyMap<number, readonly number[]>): Promise<void> {
+async function assertAllTargets(
+  plan: ExecutionPlan, expected: ReadonlyMap<number, readonly number[]>, requiredIds: readonly number[]
+): Promise<void> {
+  const required = new Set(requiredIds)
   for (const target of plan.targets) {
     const ids = expected.get(target.id)!
     await assertSnapshot(target, ids)
     const members = new Set(ids)
-    if (plan.assignments.some((assignment) => assignment.targetPlaylistIds.includes(target.id) && !members.has(assignment.songId))) {
+    if (plan.assignments.some((assignment) => required.has(assignment.songId) &&
+        assignment.targetPlaylistIds.includes(target.id) && !members.has(assignment.songId))) {
       throw new Error('仍有歌曲未完整进入全部选定目标，来源不会继续移除')
     }
   }
 }
 
-/** 核对本批仅增加指定 ID，允许头部或尾部插入，但保留原歌曲之间的相对顺序。 */
-async function verifyAdded(
-  target: PlaylistSnapshot, previous: readonly number[], batch: readonly number[]
-): Promise<readonly number[]> {
-  const current = await getPlaylistSnapshotChecked(target.id)
-  const expected = new Set([...previous, ...batch])
-  if (current.creatorId !== target.creatorId || current.name !== target.name ||
-      current.trackIds.length !== expected.size || current.trackIds.some((id) => !expected.has(id)) ||
-      !preservesOrder(previous, current.trackIds)) {
-    throw new Error('未能核验歌曲完整加入「' + target.name + '」，已停止，来源尚未开始移除')
-  }
-  return current.trackIds
-}
-
 /** 不重试写入或删除目标以回滚；回读实际成员，任何无法读取的结果均显示未知。 */
 async function readOutcome(
-  plan: ExecutionPlan, expected: ReadonlyMap<number, readonly number[]>, failure: string | null
+  plan: ExecutionPlan, expected: ReadonlyMap<number, readonly number[]>, expectedSource: readonly number[],
+  failedTracks: readonly PlaylistTrackFailure[], failure: string | null
 ): Promise<PlaylistOrganizeResult> {
   const reads = await Promise.allSettled([getPlaylistSnapshotChecked(plan.source.id),
     ...plan.targets.map((target) => getPlaylistSnapshotChecked(target.id))])
@@ -201,7 +194,7 @@ async function readOutcome(
   const currentSourceIds = source ? new Set(source.trackIds) : null
   const removed = currentSourceIds ? new Set(plan.selectedIds.filter((id) => !currentSourceIds.has(id))) : null
   const sourceVerified = source && removed ? source.creatorId === plan.userId && source.name === plan.source.name &&
-    sameIds(plan.move ? plan.source.trackIds.filter((id) => !removed.has(id)) : plan.source.trackIds, source.trackIds) : null
+    sameIds(expectedSource, source.trackIds) : null
   const targets = plan.targets.map((target, index) => {
     const read = reads[index + 1]
     const current = read.status === 'fulfilled' ? read.value : null
@@ -217,14 +210,22 @@ async function readOutcome(
         sameIds(expected.get(target.id)!, current.trackIds) : null,
     }
   })
-  const completed = !failure && accountVerified && sourceVerified === true &&
-    removed?.size === (plan.move ? plan.selectedIds.length : 0) &&
-    targets.every((target) => target.verified === true && target.missingCount === 0)
+  const verified = accountVerified && sourceVerified === true && targets.every((target) => target.verified === true)
+  const completedSongIds = verified ? plan.assignments.filter((assignment) =>
+    (!plan.move || removed?.has(assignment.songId)) && assignment.targetPlaylistIds.every((targetId) =>
+      expected.get(targetId)!.includes(assignment.songId))).map((assignment) => assignment.songId) : []
+  const completedIds = new Set(completedSongIds)
+  const skippedIds = new Set(failedTracks.map((item) => item.songId))
+  const unfinished = plan.selectedIds.filter((id) => !completedIds.has(id))
+  const finished = !failure && verified && unfinished.every((id) => skippedIds.has(id))
+  const completed = finished && unfinished.length === 0
   return {
-    status: completed ? 'completed' : 'stopped',
+    status: completed ? 'completed' : finished ? 'partial' : 'stopped',
+    failedTracks, completedSongIds: Object.freeze(completedSongIds),
     message: completed
       ? plan.move ? '归档完成，已核验全部目标及来源移除；未选中的歌曲保留原地' : '复制完成，已核验全部目标；来源保留'
-      : (failure || '最终状态未通过完整核验') + '。已停止后续写入；已加入目标的歌曲保留，请重新预览后继续' +
+      : finished ? '本次处理结束，成功 ' + completedSongIds.length + ' 首，跳过 ' + unfinished.length + ' 首；未完成歌曲保留在来源，详见失败清单'
+      : (failure || '最终状态未通过完整核验') + '。已停止后续写入；已加入目标的歌曲保留，可保留勾选重新读取后继续' +
         (!accountVerified ? '；无法确认原登录账号' : ''),
     selectedCount: plan.selectedIds.length, leftUntouchedCount: plan.source.trackIds.length - plan.selectedIds.length,
     removedCount: removed?.size ?? null, sourceRemainingCount: source?.trackIds.length ?? null,
@@ -233,9 +234,9 @@ async function readOutcome(
 }
 
 /**
- * 固定用户确认的多个去向，检查实时来源和目标，先补齐并核验所有目标，再分批移除来源。
- * 每次来源移除前后均核验所有目标；失败立即停止，只回读实际状态，不重试或回滚目标。
- * 平台没有跨歌单事务，外部并发只能在核验时发现；目标从不接收清空、覆盖或删除请求。
+ * 固定多个去向后逐批添加；歌曲级拒绝被定位、记录并跳过，其他歌曲继续处理。
+ * 只有已完整进入其全部选定目标的歌曲才进入来源移除；每次移除前后仍核验所有目标。
+ * 账号、成员异常或结果未知会停止，失败歌曲留在来源，不自动回滚已确认的添加。
  */
 export async function executePlaylistOrganize(
   preview: PlaylistOrganizePreview, assignments: readonly OrganizeAssignment[], move: boolean,
@@ -243,10 +244,13 @@ export async function executePlaylistOrganize(
 ): Promise<PlaylistOrganizeResult> {
   if (organizeRunning) throw new Error('已有归档正在执行，请等待完成')
   const plan = validatePlan(preview, assignments, move)
-  organizeRunning = true
   const expected = new Map(plan.targets.map((target) => [target.id, target.trackIds]))
+  const names = new Map(preview.tracks.map((track) => [track.id, track.name]))
+  const failedTracks: PlaylistTrackFailure[] = []
+  const recordFailure = (item: PlaylistTrackFailure) => { failedTracks.push({ ...item, songName: names.get(item.songId) }) }
   let expectedSource = plan.source.trackIds
   let failure: string | null = null
+  organizeRunning = true
   try {
     try {
       await assertUser(plan.userId)
@@ -256,37 +260,40 @@ export async function executePlaylistOrganize(
         plan.assignments.filter((assignment) => assignment.targetPlaylistIds.includes(target.id) &&
           !target.trackIds.includes(assignment.songId)).map((assignment) => assignment.songId)]))
       const total = [...missing.values()].reduce((sum, ids) => sum + ids.length, 0)
-      let added = 0
-      // 所有目标全部补齐之前，任何分支都不能移除来源歌曲。
+      let processed = 0
       for (const target of plan.targets) {
         const ids = missing.get(target.id)!
         for (let offset = 0; offset < ids.length; offset += BATCH_SIZE) {
-          await assertSnapshot(plan.source, expectedSource)
-          await assertSnapshot(target, expected.get(target.id)!)
-          await assertUser(plan.userId)
           const batch = ids.slice(offset, offset + BATCH_SIZE)
-          await addTargetPlaylistTracks(target.id, [plan.source.id], batch)
-          expected.set(target.id, await verifyAdded(target, expected.get(target.id)!, batch))
-          added += batch.length
-          onProgress?.({ phase: 'adding', completed: added, total, name: target.name })
-          if (added < total) await new Promise((resolve) => setTimeout(resolve, 500))
+          await mutatePlaylistTracks({
+            userId: plan.userId, playlist: target, expectedIds: expected.get(target.id)!, trackIds: batch, operation: 'add',
+            write: (part) => addTargetPlaylistTracks(target.id, [plan.source.id], part),
+            beforeWrite: () => assertSnapshot(plan.source, expectedSource),
+            afterWrite: () => assertSnapshot(plan.source, expectedSource),
+            onVerified: (current) => { expected.set(target.id, current) }, onFailure: recordFailure,
+          })
+          processed += batch.length
+          onProgress?.({ phase: 'adding', completed: processed, total, name: target.name })
+          if (processed < total) await new Promise((resolve) => setTimeout(resolve, 500))
         }
       }
-      await assertAllTargets(plan, expected)
+      // 按歌曲分别确认全部目标；任一去向缺失时，该歌曲仍留在来源。
+      const removable = plan.assignments.filter((assignment) => assignment.targetPlaylistIds.every((id) =>
+        expected.get(id)!.includes(assignment.songId))).map((assignment) => assignment.songId)
+      await assertAllTargets(plan, expected, removable)
       await assertSnapshot(plan.source, expectedSource)
       if (plan.move) {
-        for (let offset = 0; offset < plan.selectedIds.length; offset += BATCH_SIZE) {
-          await assertSnapshot(plan.source, expectedSource)
-          await assertAllTargets(plan, expected)
-          await assertUser(plan.userId)
-          const batch = plan.selectedIds.slice(offset, offset + BATCH_SIZE)
-          await removeSourcePlaylistTracks(plan.source.id, plan.targets[0].id, batch)
-          const removed = new Set(batch)
-          expectedSource = expectedSource.filter((id) => !removed.has(id))
-          await assertSnapshot(plan.source, expectedSource)
-          await assertAllTargets(plan, expected)
-          onProgress?.({ phase: 'removing', completed: offset + batch.length, total: plan.selectedIds.length })
-          if (offset + BATCH_SIZE < plan.selectedIds.length) await new Promise((resolve) => setTimeout(resolve, 500))
+        for (let offset = 0; offset < removable.length; offset += BATCH_SIZE) {
+          const batch = removable.slice(offset, offset + BATCH_SIZE)
+          await mutatePlaylistTracks({
+            userId: plan.userId, playlist: plan.source, expectedIds: expectedSource, trackIds: batch, operation: 'remove',
+            write: (part) => removeSourcePlaylistTracks(plan.source.id, plan.targets[0].id, part),
+            beforeWrite: () => assertAllTargets(plan, expected, removable),
+            afterWrite: () => assertAllTargets(plan, expected, removable),
+            onVerified: (current) => { expectedSource = current }, onFailure: recordFailure,
+          })
+          onProgress?.({ phase: 'removing', completed: offset + batch.length, total: removable.length })
+          if (offset + BATCH_SIZE < removable.length) await new Promise((resolve) => setTimeout(resolve, 500))
         }
       }
       await assertUser(plan.userId)
@@ -294,7 +301,7 @@ export async function executePlaylistOrganize(
       failure = err instanceof Error ? err.message : '归档请求失败，已停止后续写入'
     }
     onProgress?.({ phase: 'verifying', completed: 0, total: 0 })
-    return await readOutcome(plan, expected, failure)
+    return await readOutcome(plan, expected, expectedSource, failedTracks, failure)
   } finally {
     organizeRunning = false
   }

@@ -5,6 +5,8 @@ import {
   removeSourcePlaylistTracks,
 } from '@/api/netease-direct'
 import { parsePlaylistText, serializePlaylistText } from '@/utils/playlist-text'
+import { mutatePlaylistTracks } from '@/services/playlist-track-mutation'
+import type { PlaylistTrackFailure } from '@/types/playlist-operation'
 import type { PlaylistSnapshot } from '@/types/playlist-cleanup'
 import type {
   PlaylistMergeInput,
@@ -168,7 +170,7 @@ function copyValidatedPlan(preview: PlaylistMergePlan): PlaylistMergePlan {
 
 async function assertTarget(plan: PlaylistMergePlan, expectedIds: readonly number[]): Promise<PlaylistSnapshot> {
   const target = await getPlaylistSnapshotChecked(plan.target.id)
-  if (target.creatorId !== plan.userId || !sameIds(expectedIds, target.trackIds)) {
+  if (target.creatorId !== plan.userId || target.name !== plan.target.name || !sameIds(expectedIds, target.trackIds)) {
     throw new Error('目标歌单的内容、顺序或归属已变化，已停止后续写入，请重新预览')
   }
   return target
@@ -176,7 +178,7 @@ async function assertTarget(plan: PlaylistMergePlan, expectedIds: readonly numbe
 
 async function assertSource(plan: PlaylistMergePlan, source: PlaylistMergeSource, expectedIds: readonly number[]): Promise<void> {
   const current = await getPlaylistSnapshotChecked(source.playlistId)
-  if (current.creatorId !== plan.userId || !sameIds(expectedIds, current.trackIds)) {
+  if (current.creatorId !== plan.userId || current.name !== source.snapshot?.name || !sameIds(expectedIds, current.trackIds)) {
     throw new Error('来源歌单「' + source.name + '」与预览不一致，已停止后续写入，请重新预览')
   }
 }
@@ -187,23 +189,10 @@ async function assertAllSources(plan: PlaylistMergePlan): Promise<void> {
   }
 }
 
-/** 返回实际添加后的顺序；只能增加本批 ID，不能丢失、重排原歌曲或混入其他 ID。 */
-async function verifyAddition(
-  plan: PlaylistMergePlan,
-  previousIds: readonly number[],
-  batch: readonly number[]
-): Promise<readonly number[]> {
-  const target = await getPlaylistSnapshotChecked(plan.target.id)
-  const expectedIds = new Set([...previousIds, ...batch])
-  if (target.creatorId !== plan.userId || target.trackIds.length !== expectedIds.size ||
-      target.trackIds.some((id) => !expectedIds.has(id)) || !preservesOrder(previousIds, target.trackIds)) {
-    throw new Error('未能确认本批歌曲已完整加入目标，或目标出现其他变化；已停止，尚未开始移除来源')
-  }
-  return target.trackIds
-}
-
 /** 读取实际来源状态，未知结果用 null 表示；允许的变化仅是本次候选歌曲移除。 */
-function sourceResult(source: PlaylistMergeSource, current: PlaylistSnapshot | null, userId: number): PlaylistMergeSourceResult {
+function sourceResult(
+  source: PlaylistMergeSource, current: PlaylistSnapshot | null, userId: number, expectedIds: readonly number[]
+): PlaylistMergeSourceResult {
   const base = { playlistId: source.playlistId, name: source.name }
   if (!source.snapshot) {
     return { ...base, removedCount: 0, pendingCount: 0, remainingCount: null, verified: null }
@@ -219,7 +208,7 @@ function sourceResult(source: PlaylistMergeSource, current: PlaylistSnapshot | n
     pendingCount: source.removalTrackIds.length - removedIds.size,
     remainingCount: current.trackIds.length,
     verified: current.creatorId === userId &&
-      sameIds(source.snapshot.trackIds.filter((id) => !removedIds.has(id)), current.trackIds),
+      current.name === source.snapshot.name && sameIds(expectedIds, current.trackIds),
   }
 }
 
@@ -227,27 +216,41 @@ function sourceResult(source: PlaylistMergeSource, current: PlaylistSnapshot | n
 async function readMergeResult(
   plan: PlaylistMergePlan,
   expectedTargetIds: readonly number[],
+  expectedSources: ReadonlyMap<number, readonly number[]>, failedTracks: readonly PlaylistTrackFailure[],
   failure: string | null
 ): Promise<PlaylistMergeResult> {
   const [targetRead, ...sourceReads] = await Promise.allSettled([
     getPlaylistSnapshotChecked(plan.target.id),
     ...plan.sources.map((source) => source.snapshot ? getPlaylistSnapshotChecked(source.playlistId) : Promise.resolve(null)),
   ])
+  let accountVerified = false
+  try { accountVerified = await getCleanupUserId() === plan.userId } catch { /* 无法确认账号时不报告完成。 */ }
   const target = targetRead.status === 'fulfilled' ? targetRead.value : null
   const currentTargetIds = target ? new Set(target.trackIds) : null
   const targetPreserved = target ? target.creatorId === plan.userId && preservesOrder(plan.target.trackIds, target.trackIds) : null
   const missingTargetCount = currentTargetIds ? plan.incomingTrackIds.filter((id) => !currentTargetIds.has(id)).length : null
   const sources = plan.sources.map((source, index) => {
     const read = sourceReads[index]
-    return sourceResult(source, read.status === 'fulfilled' ? read.value : null, plan.userId)
+    return sourceResult(source, read.status === 'fulfilled' ? read.value : null, plan.userId, expectedSources.get(source.playlistId)!)
   })
-  const verifiedSources = sources.every((source, index) => !plan.sources[index].snapshot || source.verified === true && source.pendingCount === 0)
-  const completed = !failure && !!target && sameIds(expectedTargetIds, target.trackIds) &&
-    targetPreserved === true && missingTargetCount === 0 && verifiedSources
+  const failedAddIds = new Set(failedTracks.filter((item) => item.operation === 'add').map((item) => item.songId))
+  const missingKnown = !!currentTargetIds && plan.incomingTrackIds.every((id) => currentTargetIds.has(id) || failedAddIds.has(id))
+  const verifiedSources = sources.every((source, index) => !plan.sources[index].snapshot || source.verified === true)
+  const pendingKnown = plan.sources.every((source, index) => {
+    if (!source.snapshot) return true
+    const read = sourceReads[index]
+    if (read.status !== 'fulfilled' || !read.value) return false
+    return source.removalTrackIds.every((id) => !read.value!.trackIds.includes(id) || failedAddIds.has(id) ||
+      failedTracks.some((item) => item.operation === 'remove' && item.playlistId === source.playlistId && item.songId === id))
+  })
+  const finished = !failure && accountVerified && !!target && target.name === plan.target.name &&
+    sameIds(expectedTargetIds, target.trackIds) && targetPreserved === true && verifiedSources && missingKnown && pendingKnown
+  const completed = finished && missingTargetCount === 0 && sources.every((source) => source.pendingCount === 0)
   let message = completed
     ? plan.move ? '移动完成，已核验目标歌曲和来源移除结果；来源歌单保留' : '复制合并完成，已核验目标歌曲；来源未作移除'
+    : finished ? '本次处理结束，已跳过 ' + new Set(failedTracks.map((item) => item.songId)).size + ' 首未完成歌曲；这些歌曲保留在来源，其余歌曲已处理'
     : (failure || '合并结果未通过完整核验，已停止后续写入')
-  if (!completed) {
+  if (!finished) {
     if (targetPreserved === false) message += '；目标原有歌曲或相对顺序发生变化，请手动核对'
     if (!target || sources.some((source, index) => plan.sources[index].snapshot && source.verified === null)) {
       message += '；部分状态读取失败，请重新预览，勿按请求次数判断成功'
@@ -256,7 +259,8 @@ async function readMergeResult(
     message += '。已加入目标的歌曲会保留，可重新预览后继续'
   }
   return {
-    status: completed ? 'completed' : 'stopped',
+    status: completed ? 'completed' : finished ? 'partial' : 'stopped',
+    failedTracks,
     message,
     addedCount: currentTargetIds ? plan.missingTargetTrackIds.filter((id) => currentTargetIds.has(id)).length : null,
     missingTargetCount,
@@ -267,9 +271,8 @@ async function readMergeResult(
 }
 
 /**
- * 先分批补齐目标并核验全部候选 ID，再逐个来源移除已确认转入的歌曲。
- * 每批前后检查账号、归属及歌曲顺序；任何失败停止全部后续写入，仅回读实际结果。
- * 平台没有跨歌单事务，外部并发变化只能在核验时发现，因此绝不自动回滚或重试写入。
+ * 补入目标并核验实际成员，单曲失败记录后继续；仅移除已确认存在于目标的来源歌曲。
+ * 多个来源共用目标快照，拆分定位失败歌曲时也核对账号和内容；未知结果或额外变化停止写入。
  */
 export async function executePlaylistMerge(
   preview: PlaylistMergePlan,
@@ -279,48 +282,46 @@ export async function executePlaylistMerge(
   const plan = copyValidatedPlan(preview)
   mergeRunning = true
   let expectedTargetIds = plan.target.trackIds
+  const expectedSources = new Map(plan.sources.map((source) => [source.playlistId, source.snapshot?.trackIds || []]))
+  const failedTracks: PlaylistTrackFailure[] = []
   let failure: string | null = null
   try {
     try {
       await assertCurrentUser(plan.userId)
       await assertTarget(plan, expectedTargetIds)
       await assertAllSources(plan)
-
-      // 补齐全部目标歌曲，任一添加或核验失败都不进入来源移除阶段。
       for (let offset = 0; offset < plan.missingTargetTrackIds.length; offset += BATCH_SIZE) {
-        await assertTarget(plan, expectedTargetIds)
-        await assertCurrentUser(plan.userId)
         const batch = plan.missingTargetTrackIds.slice(offset, offset + BATCH_SIZE)
-        await addTargetPlaylistTracks(plan.target.id, plan.sources.map((source) => source.playlistId), batch)
-        expectedTargetIds = await verifyAddition(plan, expectedTargetIds, batch)
+        await mutatePlaylistTracks({
+          userId: plan.userId, playlist: plan.target, expectedIds: expectedTargetIds, trackIds: batch, operation: 'add',
+          write: (ids) => addTargetPlaylistTracks(plan.target.id, plan.sources.map((source) => source.playlistId), ids),
+          beforeWrite: () => assertAllSources(plan), afterWrite: () => assertAllSources(plan),
+          onVerified: (current) => { expectedTargetIds = current }, onFailure: (item) => { failedTracks.push(item) },
+        })
         onProgress?.({ phase: 'adding', completed: offset + batch.length, total: plan.missingTargetTrackIds.length })
         if (offset + BATCH_SIZE < plan.missingTargetTrackIds.length) await new Promise((resolve) => setTimeout(resolve, 500))
       }
-
-      // 所有来源在移除前重新检查，预览后新增或被调整的歌曲不会被顺带清空。
       await assertAllSources(plan)
       await assertTarget(plan, expectedTargetIds)
       const confirmedTargetIds = new Set(expectedTargetIds)
-      if (plan.incomingTrackIds.some((id) => !confirmedTargetIds.has(id))) {
-        throw new Error('目标尚未包含全部候选歌曲，已停止，来源未开始移除')
-      }
-      const totalRemovals = plan.sources.reduce((sum, source) => sum + source.removalTrackIds.length, 0)
-      let removedCount = 0
+      const ready = new Map(plan.sources.map((source) => [source.playlistId,
+        source.removalTrackIds.filter((id) => confirmedTargetIds.has(id))]))
+      const totalRemovals = [...ready.values()].reduce((sum, ids) => sum + ids.length, 0)
+      let processed = 0
       for (const source of plan.sources) {
-        let expectedSourceIds = source.snapshot?.trackIds || []
-        for (let offset = 0; offset < source.removalTrackIds.length; offset += BATCH_SIZE) {
-          await assertSource(plan, source, expectedSourceIds)
-          await assertTarget(plan, expectedTargetIds)
-          await assertCurrentUser(plan.userId)
-          const batch = source.removalTrackIds.slice(offset, offset + BATCH_SIZE)
-          await removeSourcePlaylistTracks(source.playlistId, plan.target.id, batch)
-          const batchIds = new Set(batch)
-          expectedSourceIds = expectedSourceIds.filter((id) => !batchIds.has(id))
-          await assertSource(plan, source, expectedSourceIds)
-          await assertTarget(plan, expectedTargetIds)
-          removedCount += batch.length
-          onProgress?.({ phase: 'removing', completed: removedCount, total: totalRemovals, sourceName: source.name })
-          if (offset + BATCH_SIZE < source.removalTrackIds.length) await new Promise((resolve) => setTimeout(resolve, 500))
+        const ids = ready.get(source.playlistId)!
+        for (let offset = 0; offset < ids.length; offset += BATCH_SIZE) {
+          const batch = ids.slice(offset, offset + BATCH_SIZE)
+          await mutatePlaylistTracks({
+            userId: plan.userId, playlist: source.snapshot!, expectedIds: expectedSources.get(source.playlistId)!,
+            trackIds: batch, operation: 'remove', write: (part) => removeSourcePlaylistTracks(source.playlistId, plan.target.id, part),
+            beforeWrite: async () => { await assertTarget(plan, expectedTargetIds) },
+            afterWrite: async () => { await assertTarget(plan, expectedTargetIds) },
+            onVerified: (current) => { expectedSources.set(source.playlistId, current) }, onFailure: (item) => { failedTracks.push(item) },
+          })
+          processed += batch.length
+          onProgress?.({ phase: 'removing', completed: processed, total: totalRemovals, sourceName: source.name })
+          if (processed < totalRemovals) await new Promise((resolve) => setTimeout(resolve, 500))
         }
       }
       await assertCurrentUser(plan.userId)
@@ -328,7 +329,7 @@ export async function executePlaylistMerge(
       failure = err instanceof Error ? err.message : '合并请求失败，已停止后续写入'
     }
     onProgress?.({ phase: 'verifying', completed: 0, total: 0 })
-    return await readMergeResult(plan, expectedTargetIds, failure)
+    return await readMergeResult(plan, expectedTargetIds, expectedSources, failedTracks, failure)
   } finally {
     mergeRunning = false
   }

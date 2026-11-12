@@ -1,4 +1,5 @@
 import type { PlaylistSnapshot } from './playlist-cleanup'
+import type { PlaylistOperationStatus, PlaylistTrackFailure } from './playlist-operation'
 
 export interface PlaylistTextTrack {
   readonly id: number
@@ -82,7 +83,8 @@ export interface PlaylistMergeSourceResult {
 }
 
 export interface PlaylistMergeResult {
-  status: 'completed' | 'stopped'
+  status: PlaylistOperationStatus
+  failedTracks: readonly PlaylistTrackFailure[]
   message: string
   addedCount: number | null
   missingTargetCount: number | null

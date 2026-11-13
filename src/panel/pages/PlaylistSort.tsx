@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { executePlaylistSort, previewPlaylistSort } from '@/services/playlist-sort'
 import { COMBINED_SORT_RULES, PLAYLIST_SORT_LABELS, resolveCombinedSortBasis } from '@/utils/playlist-sort'
+import { groupPlaylistTracks } from '@/utils/playlist-group-sort'
 import { usePlaylistList, usePlaylistOperation } from '../hooks/use-playlist-tools'
 import type {
   PlaylistSortMetric, PlaylistSortOptions, PlaylistSortPlan, PlaylistSortProgress, PlaylistSortResult, PlaylistSortRule,
@@ -38,7 +39,17 @@ export function PlaylistSort({ uid, onBack, onBusyChange }: Props) {
   const disabled = operation.busy || list.loading || !!list.error
   const personalCounts = options.rule === 'plays-all' || options.rule === 'plays-week'
   const combined = options.rule === 'combined'
+  const classification = options.rule === 'playlist-groups'
+  const availableReferences = list.playlists.filter((playlist) => playlist.id !== playlistId)
+  const referenceIds = options.referencePlaylistIds || availableReferences.map((playlist) => playlist.id)
+  const referenceRank = new Map(referenceIds.map((id, index) => [id, index]))
+  const orderedReferences = [...availableReferences].sort((a, b) =>
+    (referenceRank.get(a.id) ?? referenceIds.length) - (referenceRank.get(b.id) ?? referenceIds.length))
   const byId = new Map(preview?.tracks.map((track) => [track.songId, track]))
+  const placements = preview?.options.rule === 'playlist-groups'
+    ? groupPlaylistTracks(preview.tracks, preview.options.referencePlaylistIds || []) : []
+  const placementById = new Map(placements.map((item) => [item.songId, item]))
+  const referenceNames = new Map(preview?.grouping?.references.map((item) => [item.id, item.name]))
   const combinedBasis = new Map(preview?.options.rule === 'combined'
     ? preview.tracks.map((track) => [track.songId, resolveCombinedSortBasis(track.metrics)]) : [])
   const combinedGroups = [...COMBINED_SORT_RULES, null].map((rule, index) => ({
@@ -56,14 +67,23 @@ export function PlaylistSort({ uid, onBack, onBusyChange }: Props) {
 
   const changeOptions = (patch: Partial<PlaylistSortOptions>) => {
     if (operation.busyRef.current) return
-    setOptions({ ...options, ...patch, ...(patch.rule === 'combined' ? { direction: 'desc' as const, missing: 'last' as const } : {}) })
+    setOptions({ ...options, ...patch, ...(patch.rule === 'combined' || patch.rule === 'playlist-groups'
+      ? { direction: 'desc' as const, missing: 'last' as const } : {}) })
     resetPreview()
+  }
+
+  const moveReference = (index: number, delta: number) => {
+    if (index < 0 || index + delta < 0 || index + delta >= referenceIds.length) return
+    const ids = [...referenceIds]
+    ;[ids[index], ids[index + delta]] = [ids[index + delta], ids[index]]
+    changeOptions({ referencePlaylistIds: ids })
   }
 
   const handlePreview = () => operation.run(async () => {
     if (!playlistId) throw new Error('请先选择待排序的本人歌单')
     resetPreview()
-    setPreview(await previewPlaylistSort(uid, playlistId, options, setProgress))
+    setPreview(await previewPlaylistSort(uid, playlistId,
+      classification ? { ...options, referencePlaylistIds: referenceIds } : options, setProgress))
     setProgress(null)
   })
 
@@ -94,6 +114,7 @@ export function PlaylistSort({ uid, onBack, onBusyChange }: Props) {
           onChange={(event) => {
             if (operation.busyRef.current) return
             setPlaylistId(event.target.value ? Number(event.target.value) : null)
+            setOptions({ ...options, referencePlaylistIds: undefined })
             resetPreview()
           }}>
           <option value="">请选择本人创建的歌单</option>
@@ -115,6 +136,37 @@ export function PlaylistSort({ uid, onBack, onBusyChange }: Props) {
       {options.rule === 'popularity' && <p className="text-xs text-gray-500 mb-3">
         使用平台歌曲热度值（0–100），不等同于全网播放次数。多首歌曲同分时保留原相对顺序。
       </p>}
+      {classification && <div className="text-xs text-gray-600 mb-3 space-y-2">
+        <p>每轮取原顺序中第一首未排定的歌曲，按它的分类歌单优先级接入同类歌曲；同一分类内保留原相对顺序。
+          已排定的歌曲不再移动或展开，没有分类标记的歌曲也会保留。</p>
+        <p>参考歌单仅用于分类，当前待排序歌单自动排除。默认使用账号中的其他自建及收藏歌单，优先级从上到下；
+          可取消“我喜欢”“未分类”等汇总歌单，避免把不同类型合成一大段。</p>
+        <p className="font-semibold">分类歌单及优先级 · 已选 {referenceIds.length} 个</p>
+        <div className="flex gap-2">
+          <button className={buttonClass + ' tn-btn-secondary'} disabled={disabled}
+            onClick={() => changeOptions({ referencePlaylistIds: undefined })}>全选并恢复列表顺序</button>
+          <button className={buttonClass + ' tn-btn-secondary'} disabled={disabled}
+            onClick={() => changeOptions({ referencePlaylistIds: [] })}>全不选</button>
+        </div>
+        <ol className="max-h-64 overflow-y-auto border border-gray-200 rounded-lg p-2 space-y-2">
+          {orderedReferences.map((playlist) => {
+            const rank = referenceRank.get(playlist.id)
+            return <li key={playlist.id} className="flex gap-2 items-center">
+              <label className="flex gap-2 min-w-0 flex-1 items-start">
+                <input type="checkbox" checked={rank !== undefined} disabled={disabled}
+                  onChange={(event) => changeOptions({ referencePlaylistIds: event.target.checked
+                    ? [...referenceIds, playlist.id] : referenceIds.filter((id) => id !== playlist.id) })} />
+                <span className="break-words">{rank !== undefined ? (rank + 1) + '. ' : ''}{playlist.name}
+                  <span className="text-gray-400"> · ID {playlist.id}</span></span>
+              </label>
+              <button className={buttonClass + ' tn-btn-secondary'} disabled={disabled || rank === undefined || rank === 0}
+                aria-label={'上移分类 ' + playlist.name} onClick={() => moveReference(rank ?? -1, -1)}>上移</button>
+              <button className={buttonClass + ' tn-btn-secondary'} disabled={disabled || rank === undefined || rank === referenceIds.length - 1}
+                aria-label={'下移分类 ' + playlist.name} onClick={() => moveReference(rank ?? -1, 1)}>下移</button>
+            </li>
+          })}
+        </ol>
+      </div>}
       {combined && <div className="text-xs text-gray-600 mb-3 space-y-1">
         <p className="font-semibold">按以下优先级分成五部分：</p>
         <ol className="list-decimal pl-5 space-y-1">
@@ -129,14 +181,14 @@ export function PlaylistSort({ uid, onBack, onBusyChange }: Props) {
       {(personalCounts || combined) && <p className="text-xs text-amber-700 mb-3">
         使用当前登录用户的听歌排行次数，平台返回的歌曲数量有限。未进入返回排行的歌曲次数未知，不代表 0 次。暂不支持完整的最近一个月统计。
       </p>}
-      {!combined && <label className="block text-sm font-semibold mb-3">排序方向
+      {!combined && !classification && <label className="block text-sm font-semibold mb-3">排序方向
         <select className={fieldClass} value={options.direction} disabled={disabled}
           onChange={(event) => changeOptions({ direction: event.target.value as PlaylistSortOptions['direction'] })}>
           <option value="desc">{options.rule === 'added' ? '最近加入的在前' : '数值从高到低'}</option>
           <option value="asc">{options.rule === 'added' ? '最早加入的在前' : '数值从低到高'}</option>
         </select>
       </label>}
-      {!combined && <label className="block text-sm font-semibold mb-3">缺少排序数据的歌曲
+      {!combined && !classification && <label className="block text-sm font-semibold mb-3">缺少排序数据的歌曲
         <select className={fieldClass} value={options.missing} disabled={disabled}
           onChange={(event) => changeOptions({ missing: event.target.value as PlaylistSortOptions['missing'] })}>
           <option value="last">放到末尾，保留它们的原相对顺序</option>
@@ -148,22 +200,39 @@ export function PlaylistSort({ uid, onBack, onBusyChange }: Props) {
       {operation.busy && progress && <p className="text-sm text-gray-600 mt-3" role="status">
         {({
           reading: '读取完整歌单', details: '读取歌曲详情', records: '读取本人听歌排行',
+          categories: '读取参考歌单并标记分类',
           checking: '检查账号和当前歌单', writing: '提交完整歌曲顺序', verifying: '回读核验顺序及成员',
-        })[progress.phase]}{(progress.phase === 'details' || progress.phase === 'records') && '：' + progress.completed + ' / ' + progress.total}
+        })[progress.phase]}{['details', 'records', 'categories'].includes(progress.phase) && '：' + progress.completed + ' / ' + progress.total}
       </p>}
       {operation.error && <p className="text-sm text-red-600 mt-3" role="alert">{operation.error}</p>}
       {preview && (
         <div className="border border-gray-200 rounded-xl p-3 mt-4">
           <p className="text-sm font-semibold break-words">「{preview.playlist.name}」· ID {preview.playlist.id}</p>
-          <p className="text-xs text-gray-600 mt-2">共 {preview.tracks.length} 首；有排序数据 {preview.knownCount} 首，
-            {preview.options.rule === 'combined' ? '无可用指标' : '未知'} {preview.missingCount} 首。</p>
+          <p className="text-xs text-gray-600 mt-2">共 {preview.tracks.length} 首；
+            {preview.options.rule === 'playlist-groups' ? '有分类标记' : '有排序数据'} {preview.knownCount} 首，
+            {preview.options.rule === 'playlist-groups' ? '未匹配到分类标记' : preview.options.rule === 'combined' ? '无可用指标' : '未知'} {preview.missingCount} 首。</p>
           {preview.playlist.reportedTrackCount !== preview.tracks.length && <p className="text-xs text-amber-700 mt-2">
             已兼容云盘数量差异：平台统计 {preview.playlist.reportedTrackCount} 首，云盘统计 {preview.playlist.cloudTrackCount} 首；
             本次保留并排序全部 {preview.tracks.length} 首歌曲。
           </p>}
           <p className="text-xs text-gray-600 mt-1">依据：{PLAYLIST_SORT_LABELS[preview.options.rule]}；
+            {preview.options.rule === 'playlist-groups' ? '分类优先级优先，同类按原相对顺序；未标记歌曲按轮次保留' : <>
             {preview.options.direction === 'desc' ? '降序' : '升序'}；
-            {preview.options.rule === 'combined' ? '无可用指标放末尾' : preview.options.missing === 'last' ? '未知放末尾' : '未知固定原位置'}。</p>
+            {preview.options.rule === 'combined' ? '无可用指标放末尾' : preview.options.missing === 'last' ? '未知放末尾' : '未知固定原位置'}。
+            </>}
+          </p>
+          {preview.grouping && <div className="text-xs text-gray-600 mt-2 space-y-1">
+            <p className="font-semibold">已读取 {preview.grouping.references.length} 个分类歌单；共 {placements.length > 0 ? placements[placements.length - 1].groupIndex + 1 : 0} 段。</p>
+            <details><summary className="cursor-pointer">查看本次分类优先级与匹配数量</summary>
+              {preview.grouping.references.map((reference, index) => <p key={reference.id} className="mt-1">
+                {index + 1}. {reference.name} · ID {reference.id} · 匹配 {reference.matchedTrackIds.length} 首
+              </p>)}
+            </details>
+            {preview.grouping.failures.length > 0 && <div className="text-amber-700" role="alert">
+              <p>以下 {preview.grouping.failures.length} 个参考歌单读取失败，已跳过；本次仅按成功读取的分类排序，所有歌曲仍保留。</p>
+              {preview.grouping.failures.map((failure) => <p key={failure.id}>{failure.name} · ID {failure.id}：{failure.message}</p>)}
+            </div>}
+          </div>}
           {preview.options.rule === 'combined' && <div className="text-xs text-gray-600 mt-2 space-y-1">
             <p className="font-semibold">分组结果（每首歌只进入第一个指标大于 0 的组，否则保持原相对顺序放末尾）</p>
             {combinedGroups.map((group, index) => <p key={index}>第 {index + 1} 部分 · {group.label}：{group.count} 首</p>)}
@@ -184,21 +253,26 @@ export function PlaylistSort({ uid, onBack, onBusyChange }: Props) {
               ? <p className="text-amber-700">当前歌单有歌曲上榜，但均缺少有效的听歌次数。不能用排行分数代替次数，具体原因见各首歌曲。</p>
               : null}
           </div>}
-          {preview.missingCount > 0 && <p className="text-xs text-amber-700 mt-2">
+          {preview.missingCount > 0 && preview.options.rule !== 'playlist-groups' && <p className="text-xs text-amber-700 mt-2">
             {preview.options.rule === 'combined' ? '0 或未知均使用下一指标，无可用指标的歌曲保持原相对顺序，所有歌曲仍保留在当前歌单。'
               : '未知数据不按 0 计算，所有歌曲仍保留在当前歌单。'}{personalCounts && '这只能重排平台返回了可用次数的歌曲，不能还原完整播放历史。'}
           </p>}
           <p className="text-sm font-semibold mt-3">预览新顺序 · {preview.changedCount} 首的位置将变化</p>
           {preview.knownCount === 0 && <p className="text-xs text-amber-700 mt-2">没有可用的排序数据，当前顺序保留，不执行写入。</p>}
           {preview.knownCount > 0 && preview.changedCount === 0 &&
-            <p className="text-xs text-green-700 mt-2">当前顺序已经符合所选规则，无需写入；相同数值保持原相对顺序。</p>}
+            <p className="text-xs text-green-700 mt-2">当前顺序已经符合所选规则，无需写入；
+              {preview.options.rule === 'playlist-groups' ? '已保留各分类内的原相对顺序。' : '相同数值保持原相对顺序。'}</p>}
           <ol className="space-y-2 mt-3">
             {preview.orderedTrackIds.slice(0, visibleCount).map((songId, index) => {
               const track = byId.get(songId)!
               const basis = combinedBasis.get(songId)
-              const metricRule = preview.options.rule === 'combined' ? basis!.rule : preview.options.rule
+              const placement = placementById.get(songId)
+              const metricRule = preview.options.rule === 'playlist-groups' ? null : preview.options.rule === 'combined' ? basis!.rule : preview.options.rule
               const groupStarts = basis && (index === 0 || combinedBasis.get(preview.orderedTrackIds[index - 1])?.groupIndex !== basis.groupIndex)
               return <li key={songId} className="border-t border-gray-100 pt-2" data-song-id={songId}>
+                {placement?.anchorId === songId && <p className="text-xs font-semibold text-gray-700 bg-gray-50 rounded p-2 mb-2">
+                  第 {placement.groupIndex + 1} 段 · 起始歌曲 {track.name || songId}
+                </p>}
                 {groupStarts && <p className="text-xs font-semibold text-gray-700 bg-gray-50 rounded p-2 mb-2">
                   第 {basis.groupIndex + 1} 部分 · {combinedGroups[basis.groupIndex].label} · {combinedGroups[basis.groupIndex].count} 首
                 </p>}
@@ -207,9 +281,16 @@ export function PlaylistSort({ uid, onBack, onBusyChange }: Props) {
                   <div className="min-w-0 flex-1">
                     <p className="font-semibold break-words">{track.name || '歌曲详情不可用'} <span className="font-normal text-gray-400">ID {songId}</span></p>
                     {track.artists.length > 0 && <p className="text-gray-500 break-words mt-0.5">{track.artists.join(' / ')}</p>}
-                    <p className={'mt-1 font-semibold ' + (track.value === null ? 'text-amber-700' : 'text-blue-700')}>
+                    {placement ? <div className="mt-1 text-blue-700">
+                      <p className="font-semibold">{placement.playlistId === null ? '本段起始歌曲，按原顺序选取' :
+                        '跟随「' + (byId.get(placement.anchorId)?.name || placement.anchorId) + '」· 共同分类：' +
+                        referenceNames.get(placement.playlistId) + '（ID ' + placement.playlistId + '）'}</p>
+                      <p className="text-gray-500 mt-1">分类标记：{track.playlistTags!.length > 0
+                        ? track.playlistTags!.map((id) => (referenceNames.get(id) || '') + '（ID ' + id + '）').join(' → ')
+                        : '未匹配到已读取的分类歌单，歌曲保留'}</p>
+                    </div> : <p className={'mt-1 font-semibold ' + (track.value === null ? 'text-amber-700' : 'text-blue-700')}>
                       {basis ? '第 ' + (basis.groupIndex + 1) + ' 部分 · ' : '排序依据 · '}
-                      {metricRule ? formatValue(track.value, metricRule) : '无可用指标，保持原相对顺序'}</p>
+                      {metricRule ? formatValue(track.value, metricRule) : '无可用指标，保持原相对顺序'}</p>}
                     {basis && track.metrics && <details className="text-gray-500 mt-1">
                       <summary className="cursor-pointer">查看四项排序数据</summary>
                       {COMBINED_SORT_RULES.map((rule) => <p key={rule} className="mt-1">{formatValue(track.metrics![rule], rule)}</p>)}

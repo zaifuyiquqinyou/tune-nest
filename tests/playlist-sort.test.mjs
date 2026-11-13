@@ -18,7 +18,8 @@ function loadSource(path, imports = {}) {
 }
 
 const api = loadSource('src/api/netease-direct.ts')
-const sorter = loadSource('src/utils/playlist-sort.ts')
+const groupSorter = loadSource('src/utils/playlist-group-sort.ts')
+const sorter = loadSource('src/utils/playlist-sort.ts', { './playlist-group-sort': groupSorter })
 const service = loadSource('src/services/playlist-sort.ts', {
   '@/api/netease-direct': api, '@/utils/playlist-sort': sorter,
 })
@@ -61,7 +62,8 @@ function fixture(t, ids = [1, 2, 3, 4, 5]) {
     const playlist = state.playlists.get(id)
     return { code: 200, playlist: {
       id, name: playlist.name, creator: { userId: playlist.creatorId },
-      trackCount: state.count ?? playlist.trackIds.length, cloudTrackCount: state.cloudCount,
+      trackCount: (id === SOURCE ? state.count : undefined) ?? playlist.trackIds.length,
+      cloudTrackCount: id === SOURCE ? state.cloudCount : undefined,
       trackIds: playlist.trackIds.map((id) => ({ id, at: state.added.get(id) })),
     } }
   }
@@ -78,11 +80,17 @@ function fixture(t, ids = [1, 2, 3, 4, 5]) {
       const override = state.onAccount ? await state.onAccount(++state.accountReads) : undefined
       return respond(override ?? { code: 200, profile: { userId: state.userId } })
     }
+    if (path === '/api/user/playlist') {
+      assert.equal(Number(params.get('uid')), USER)
+      return respond({ code: 200, more: false, playlist: [...state.playlists.values()].map((playlist) => ({
+        id: playlist.id, name: playlist.name, creator: { userId: playlist.creatorId }, trackCount: playlist.trackIds.length,
+      })) })
+    }
     if (path === '/api/v6/playlist/detail') {
       const id = Number(params.get('id'))
       state.events.push({ kind: 'read', id })
       const override = state.onRead ? await state.onRead(id) : undefined
-      return respond(override ?? state.detail(id))
+      return override instanceof Response ? override : respond(override ?? state.detail(id))
     }
     if (path === '/api/v3/song/detail') {
       const ids = JSON.parse(params.get('c')).map((item) => item.id)
@@ -388,6 +396,279 @@ test('combined preview shows five groups, their counts, actual metric values and
   assert.doesNotMatch(html, />缺少排序数据的歌曲</)
 })
 
+const THIRD_CATEGORY = 404
+const groupOptions = (ids) => ({ ...options('playlist-groups'), ...(ids === undefined ? {} : { referencePlaylistIds: ids }) })
+
+function categoryFixture(t) {
+  const state = fixture(t, Array.from({ length: 73 }, (_, index) => index + 1))
+  state.playlists.get(OTHER).name = '分类 U'
+  state.playlists.get(OTHER).trackIds = [73, 1, 33, 999]
+  state.playlists.get(COLLECTED).name = '分类 I'
+  state.playlists.get(COLLECTED).trackIds = [73, 7, 1]
+  state.playlists.set(THIRD_CATEGORY, { id: THIRD_CATEGORY, name: '分类 V', creatorId: USER, trackIds: [33, 5, 2] })
+  return state
+}
+
+test('category grouping follows A U/I example, uses source order and never expands already placed members', async (t) => {
+  const state = categoryFixture(t)
+  const referencesBefore = [...state.playlists.values()].filter((item) => item.id !== SOURCE).map((item) => [...item.trackIds])
+  const progress = []
+  const plan = await service.previewPlaylistSort(USER, SOURCE, groupOptions(), (value) => progress.push(value))
+  assert.deepEqual(plan.options.referencePlaylistIds, [OTHER, COLLECTED, THIRD_CATEGORY])
+  assert.deepEqual(plan.orderedTrackIds.slice(0, 8), [1, 33, 73, 7, 2, 5, 3, 4])
+  assert.equal(new Set(plan.orderedTrackIds).size, 73)
+  assert.equal(plan.knownCount, 6)
+  assert.deepEqual(plan.tracks[0].playlistTags, [OTHER, COLLECTED])
+  assert.deepEqual(plan.tracks[32].playlistTags, [OTHER, THIRD_CATEGORY])
+  assert.deepEqual(plan.tracks[72].playlistTags, [OTHER, COLLECTED])
+  assert.ok(plan.tracks.every((item) => !item.playlistTags.includes(SOURCE)))
+  const placed = groupSorter.groupPlaylistTracks(plan.tracks, plan.options.referencePlaylistIds)
+  assert.deepEqual(placed.slice(0, 6).map(({ songId, anchorId, playlistId, groupIndex }) => [songId, anchorId, playlistId, groupIndex]),
+    [[1, 1, null, 0], [33, 1, OTHER, 0], [73, 1, OTHER, 0], [7, 1, COLLECTED, 0], [2, 2, null, 1], [5, 2, THIRD_CATEGORY, 1]])
+  assert.deepEqual(progress.filter((item) => item.phase === 'categories').at(-1), { phase: 'categories', completed: 3, total: 3 })
+  assert.equal(state.requests.filter((item) => item.path === '/api/v1/play/record').length, 0)
+  assert.equal(state.events.filter((item) => item.kind === 'read' && item.id === SOURCE).length, 1)
+  assert.equal(state.writes.length, 0)
+  assert.ok(Object.isFrozen(plan.options.referencePlaylistIds))
+  assert.ok(Object.isFrozen(plan.grouping.references[0].matchedTrackIds))
+  assert.ok(plan.tracks.every((item) => Object.isFrozen(item.playlistTags)))
+  const outcome = await service.executePlaylistSort(plan)
+  assert.equal(outcome.status, 'completed')
+  assert.equal(outcome.membershipPreserved, true)
+  assert.deepEqual(state.writes, [{ pid: SOURCE, op: 'update', ids: [...plan.orderedTrackIds] }])
+  assert.deepEqual([...state.playlists.values()].filter((item) => item.id !== SOURCE).map((item) => [...item.trackIds]), referencesBefore)
+  assert.equal((await preview(groupOptions())).changedCount, 0, 'Repeated grouping must be stable')
+})
+
+test('category priority overrides current song positions and references may be excluded', async (t) => {
+  categoryFixture(t)
+  let plan = await preview(groupOptions([COLLECTED, OTHER, THIRD_CATEGORY]))
+  assert.deepEqual(plan.orderedTrackIds.slice(0, 6), [1, 7, 73, 33, 2, 5])
+  assert.deepEqual(plan.tracks[0].playlistTags, [COLLECTED, OTHER])
+  plan = await preview(groupOptions([OTHER]))
+  assert.deepEqual(plan.orderedTrackIds.slice(0, 6), [1, 33, 73, 2, 3, 4])
+  assert.deepEqual(plan.tracks[6].playlistTags, [])
+  assert.deepEqual(plan.grouping.references.map((item) => item.id), [OTHER])
+})
+
+test('untagged songs keep their turn as anchors instead of being forced to the end', async (t) => {
+  const state = fixture(t)
+  state.playlists.get(OTHER).trackIds = [5, 2]
+  const plan = await preview(groupOptions([OTHER]))
+  assert.deepEqual(plan.orderedTrackIds, [1, 2, 5, 3, 4])
+  assert.deepEqual(plan.tracks[0].playlistTags, [])
+  assert.equal((await service.executePlaylistSort(plan)).membershipPreserved, true)
+})
+
+test('empty reference selection, no overlaps and empty playlists keep every ID without writing', async (t) => {
+  const state = fixture(t)
+  for (const ids of [[], [OTHER]]) {
+    const plan = await preview(groupOptions(ids))
+    assert.deepEqual(plan.orderedTrackIds, [1, 2, 3, 4, 5])
+    assert.equal(plan.knownCount, 0)
+    assert.equal((await service.executePlaylistSort(plan)).status, 'completed')
+  }
+  state.playlists.get(SOURCE).trackIds = []
+  const empty = await preview(groupOptions())
+  assert.deepEqual(empty.orderedTrackIds, [])
+  assert.equal((await service.executePlaylistSort(empty)).status, 'completed')
+  assert.equal(state.writes.length, 0)
+})
+
+test('malformed reference selection and target self-reference are rejected before writes', async (t) => {
+  const state = categoryFixture(t)
+  for (const ids of [[SOURCE], [OTHER, OTHER], [0], ['202'], [99999]]) {
+    await assert.rejects(preview(groupOptions(ids)))
+  }
+  for (const config of [{ ...groupOptions(), direction: 'asc' }, { ...groupOptions(), missing: 'keep' }]) {
+    await assert.rejects(preview(config), /排序规则/)
+  }
+  assert.equal(state.writes.length, 0)
+})
+
+test('invalid, duplicate and out-of-priority song tags cannot produce a category order', () => {
+  for (const tags of [undefined, [OTHER, OTHER], [COLLECTED, OTHER], [999]]) {
+    assert.throws(() => groupSorter.groupPlaylistTracks([{ ...tracks([null])[0], playlistTags: tags }], [OTHER, COLLECTED]))
+  }
+  assert.throws(() => groupSorter.groupPlaylistTracks([{ ...tracks([0])[0], playlistTags: [] }], []))
+})
+
+test('category preview skips unreadable or incomplete references, displays failures and keeps all songs', async (t) => {
+  const state = categoryFixture(t)
+  state.onRead = (id) => id === COLLECTED ? { code: 403, message: '参考歌单不可读' }
+    : id === THIRD_CATEGORY ? { code: 200, playlist: { ...state.detail(id).playlist, trackCount: 50 } } : undefined
+  const plan = await preview(groupOptions())
+  assert.deepEqual(plan.grouping.references.map((item) => item.id), [OTHER])
+  assert.deepEqual(plan.grouping.failures.map((item) => item.id), [COLLECTED, THIRD_CATEGORY])
+  assert.deepEqual(plan.orderedTrackIds.slice(0, 5), [1, 33, 73, 2, 3])
+  assert.equal(plan.orderedTrackIds.length, 73)
+  const html = renderSortPreview(plan)
+  assert.match(html, /2 个参考歌单读取失败，已跳过/)
+  assert.match(html, /参考歌单不可读/)
+  assert.match(html, /成员数量不完整/)
+  assert.equal((await service.executePlaylistSort(plan)).membershipPreserved, true)
+})
+
+test('all failed references leave the source order unchanged and never write', async (t) => {
+  const state = categoryFixture(t)
+  state.onRead = (id) => id !== SOURCE ? { code: 404, message: '参考歌单不存在' } : undefined
+  const plan = await preview(groupOptions())
+  assert.equal(plan.grouping.failures.length, 3)
+  assert.equal(plan.changedCount, 0)
+  assert.equal(plan.missingCount, 73)
+  assert.equal((await service.executePlaylistSort(plan)).status, 'completed')
+  assert.equal(state.writes.length, 0)
+})
+
+for (const code of [401, 429]) {
+  test('category reading stops on serious account or rate-limit error ' + code, async (t) => {
+    const state = categoryFixture(t)
+    state.onRead = (id) => id === OTHER ? { code, message: '账号或限流异常' } : undefined
+    await assert.rejects(preview(groupOptions()), /账号或限流异常/)
+    assert.equal(state.events.filter((item) => item.kind === 'read' && item.id === COLLECTED).length, 0)
+    assert.equal(state.writes.length, 0)
+  })
+  test('category reading stops on HTTP authentication or rate-limit error ' + code, async (t) => {
+    const state = categoryFixture(t)
+    state.onRead = (id) => id === OTHER ? new Response('{}', { status: code }) : undefined
+    await assert.rejects(preview(groupOptions()), /Request failed:/)
+    assert.equal(state.events.filter((item) => item.kind === 'read' && item.id === COLLECTED).length, 0)
+    assert.equal(state.writes.length, 0)
+  })
+}
+
+test('category reading stops on a named login or risk-control rejection even with another error code', async (t) => {
+  const state = categoryFixture(t)
+  state.onRead = (id) => id === OTHER ? { code: 500, message: '请求过多，请输入验证码' } : undefined
+  await assert.rejects(preview(groupOptions()), /验证码/)
+  assert.equal(state.events.filter((item) => item.kind === 'read' && item.id === COLLECTED).length, 0)
+  assert.equal(state.writes.length, 0)
+})
+
+test('unavailable song details and separately counted cloud songs survive classification and one full write', async (t) => {
+  const cloudId = 401910689
+  const ids = [...Array.from({ length: 260 }, (_, index) => index + 1), cloudId]
+  const state = fixture(t, ids)
+  state.count = 260
+  state.cloudCount = 1
+  state.playlists.get(OTHER).trackIds = [cloudId, 33, 1]
+  state.onSongs = (batch) => batch.includes(cloudId) ? { code: 512, message: '歌曲不存在' } : undefined
+  const plan = await preview(groupOptions([OTHER]))
+  assert.deepEqual(plan.orderedTrackIds.slice(0, 3), [1, 33, cloudId])
+  assert.deepEqual(plan.tracks.at(-1).playlistTags, [OTHER])
+  assert.equal(plan.tracks.at(-1).name, '')
+  assert.equal((await service.executePlaylistSort(plan)).membershipPreserved, true)
+  assert.equal(state.writes.length, 1)
+  assert.deepEqual([...state.writes[0].ids].sort((a, b) => a - b), ids)
+})
+
+test('category tag, priority, intersection and member tampering is rejected before any write', async (t) => {
+  const state = categoryFixture(t)
+  const plan = await preview(groupOptions())
+  const requestsBefore = state.requests.length
+  for (const altered of [
+    { ...plan, grouping: null },
+    { ...plan, tracks: plan.tracks.map((item, index) => index === 0 ? { ...item, playlistTags: [] } : item) },
+    { ...plan, options: { ...plan.options, referencePlaylistIds: [COLLECTED, OTHER, THIRD_CATEGORY] } },
+    { ...plan, grouping: { ...plan.grouping, references: plan.grouping.references.slice(1) } },
+    { ...plan, grouping: { ...plan.grouping, references: plan.grouping.references.map((item, index) => index === 0
+      ? { ...item, matchedTrackIds: [...item.matchedTrackIds, 999] } : item) } },
+    { ...plan, orderedTrackIds: plan.orderedTrackIds.slice(1) },
+  ]) await assert.rejects(service.executePlaylistSort(altered))
+  assert.equal(state.requests.length, requestsBefore)
+  assert.equal(state.writes.length, 0)
+})
+
+test('classification execution copies nested tags, reference intersections and options before awaiting', async (t) => {
+  const state = categoryFixture(t)
+  const plan = await preview(groupOptions())
+  const supplied = { ...plan, options: { ...plan.options, referencePlaylistIds: [...plan.options.referencePlaylistIds] },
+    tracks: plan.tracks.map((item) => ({ ...item, playlistTags: [...item.playlistTags] })),
+    grouping: { ...plan.grouping, references: plan.grouping.references.map((item) => ({ ...item, matchedTrackIds: [...item.matchedTrackIds] })) },
+  }
+  const pending = service.executePlaylistSort(supplied, ({ phase }) => {
+    if (phase !== 'checking') return
+    supplied.tracks[0].playlistTags.length = 0
+    supplied.options.referencePlaylistIds.reverse()
+    supplied.grouping.references[0].matchedTrackIds.length = 0
+  })
+  assert.equal((await pending).status, 'completed')
+  assert.deepEqual(state.writes[0].ids, plan.orderedTrackIds)
+})
+
+test('classification cannot overwrite a source membership change after preview', async (t) => {
+  const state = categoryFixture(t)
+  const plan = await preview(groupOptions())
+  state.playlists.get(SOURCE).trackIds.push(9000)
+  assert.equal((await service.executePlaylistSort(plan)).status, 'stopped')
+  assert.equal(state.writes.length, 0)
+  assert.ok(state.playlists.get(SOURCE).trackIds.includes(9000))
+})
+
+test('classification preview shows playlist ID tags, anchors and actual shared category', async (t) => {
+  categoryFixture(t)
+  const html = renderSortPreview(await preview(groupOptions()))
+  assert.match(html, /有分类标记 6 首/)
+  assert.match(html, /分类 U（ID 202） → 分类 I（ID 303）/)
+  assert.match(html, /共同分类：分类 U（ID 202）/)
+  assert.match(html, /第 1 段 · 起始歌曲 歌曲1/)
+  assert.match(html, /未匹配到已读取的分类歌单，歌曲保留/)
+  assert.doesNotMatch(html, />排序方向<|>缺少排序数据的歌曲<|未知放末尾|无可用指标放末尾/)
+})
+
+test('category UI normalizes policy, excludes the target, reorders references and invalidates old previews', async (t) => {
+  const state = categoryFixture(t)
+  const previous = await preview(options('added', 'asc', 'keep'))
+  const states = [SOURCE, previous.options, previous, null, null, 50, false]
+  const busyRef = { current: false }
+  let cursor = 0
+  const page = loadSource('src/panel/pages/PlaylistSort.tsx', {
+    react: { useState: () => {
+      const index = cursor++
+      return [states[index], (value) => { states[index] = typeof value === 'function' ? value(states[index]) : value }]
+    } },
+    'react/jsx-runtime': jsxRuntime,
+    '@/services/playlist-sort': service, '@/utils/playlist-sort': sorter, '@/utils/playlist-group-sort': groupSorter,
+    '../hooks/use-playlist-tools': {
+      usePlaylistList: () => ({ playlists: [...state.playlists.values()].map((item) => ({
+        id: item.id, name: item.name, creator: { userId: item.creatorId }, trackCount: item.trackIds.length,
+      })), loading: false, error: null }),
+      usePlaylistOperation: () => ({ busy: busyRef.current, busyRef, error: null, setError: () => {}, run: async (action) => action() }),
+    },
+  })
+  const elements = (node) => Array.isArray(node) ? node.flatMap(elements)
+    : node && typeof node === 'object' ? [node, ...elements(node.props?.children)] : []
+  const render = () => {
+    cursor = 0
+    return elements(page.PlaylistSort({ uid: USER, onBack: () => {}, onBusyChange: () => {} }))
+  }
+  render().find((node) => node.type === 'select' && node.props.value === 'added').props.onChange({ target: { value: 'playlist-groups' } })
+  assert.equal(states[1].direction, 'desc')
+  assert.equal(states[1].missing, 'last')
+  assert.equal(states[2], null)
+  assert.equal(render().filter((node) => node.type === 'input' && node.props.type === 'checkbox').length, 3)
+  render().find((node) => node.props['aria-label'] === '下移分类 分类 U').props.onClick()
+  assert.deepEqual(states[1].referencePlaylistIds, [COLLECTED, OTHER, THIRD_CATEGORY])
+  render().find((node) => node.type === 'input' && node.props.type === 'checkbox').props.onChange({ target: { checked: false } })
+  assert.deepEqual(states[1].referencePlaylistIds, [OTHER, THIRD_CATEGORY])
+  await render().find((node) => node.type === 'button' && node.props.children === '读取数据并预览排序').props.onClick()
+  assert.deepEqual(states[2].options.referencePlaylistIds, [OTHER, THIRD_CATEGORY])
+  assert.deepEqual(states[2].orderedTrackIds.slice(0, 5), [1, 33, 73, 2, 5])
+  const selected = states[1]
+  busyRef.current = true
+  render().find((node) => node.type === 'button' && node.props.children === '全不选').props.onClick()
+  assert.equal(states[1], selected)
+  busyRef.current = false
+  render().find((node) => node.type === 'select' && node.props.value === SOURCE).props.onChange({ target: { value: String(OTHER) } })
+  assert.equal(states[0], OTHER)
+  assert.equal(states[1].referencePlaylistIds, undefined)
+  assert.equal(states[2], null)
+  render().find((node) => node.type === 'button' && node.props.children === '全不选').props.onClick()
+  assert.deepEqual(states[1].referencePlaylistIds, [])
+  assert.ok(render().filter((node) => node.type === 'input' && node.props.type === 'checkbox').every((node) => !node.props.checked))
+  assert.equal(state.writes.length, 0)
+})
+
 test('sort validation rejects unsupported month, prototype names and malformed policy values', () => {
   for (const value of [
     options('plays-month'), options('__proto__'), options('constructor'), options('toString'),
@@ -580,6 +861,7 @@ function renderSortPreview(plan) {
   const page = loadSource('src/panel/pages/PlaylistSort.tsx', {
     react: { useState: () => [states[cursor++], () => {}] }, 'react/jsx-runtime': jsxRuntime,
     '@/services/playlist-sort': service, '@/utils/playlist-sort': sorter,
+    '@/utils/playlist-group-sort': groupSorter,
     '../hooks/use-playlist-tools': {
       usePlaylistList: () => ({ playlists: [{ id: SOURCE, name: '测试歌单', creator: { userId: USER }, trackCount: plan.tracks.length }], loading: false, error: null }),
       usePlaylistOperation: () => ({ busy: false, busyRef: { current: false }, error: null }),

@@ -1,6 +1,7 @@
 import {
   getCleanupUserId, getPlaylistSortPlayCountsChecked, getPlaylistSortSnapshotChecked,
   getPlaylistSortSongsChecked, updatePlaylistTrackOrderChecked, isUnavailableSongError,
+  getUserPlaylistsChecked, NeteaseBusinessError,
 } from '@/api/netease-direct'
 import { resolveCombinedSortBasis, sortPlaylistTracks, validPlaylistSortValue, validatePlaylistSortOptions } from '@/utils/playlist-sort'
 import type {
@@ -8,6 +9,7 @@ import type {
   PlaylistSortSnapshot, PlaylistSortSong, PlaylistSortTrack,
   PlaylistSortPlayCount, PlaylistSortPlayCountSummary,
   PlaylistSortMetric, PlaylistSortMetrics,
+  PlaylistSortGrouping,
 } from '@/types/playlist-sort'
 
 let sorting = false
@@ -78,27 +80,75 @@ function freezeTracks(tracks: readonly PlaylistSortTrack[]): readonly PlaylistSo
   return Object.freeze(tracks.map((track) => Object.freeze({
     ...track, artists: Object.freeze([...track.artists]),
     ...(track.metrics ? { metrics: Object.freeze({ ...track.metrics }) } : {}),
+    ...(track.playlistTags ? { playlistTags: Object.freeze([...track.playlistTags]) } : {}),
   })))
+}
+
+function freezeOptions(options: PlaylistSortOptions): PlaylistSortOptions {
+  return Object.freeze({ ...options,
+    ...(options.referencePlaylistIds ? { referencePlaylistIds: Object.freeze([...options.referencePlaylistIds]) } : {}),
+  })
+}
+
+/** 固定参考分类的交集与读取失败项，核对标记来自所选参考歌单，不能把目标自身当作分类。 */
+function copyGrouping(
+  grouping: PlaylistSortGrouping | null, playlist: PlaylistSortSnapshot,
+  options: PlaylistSortOptions, tracks: readonly PlaylistSortTrack[]
+): PlaylistSortGrouping | null {
+  if (options.rule !== 'playlist-groups') return null
+  const ids = options.referencePlaylistIds
+  if (!ids || ids.includes(playlist.id) || !grouping || !Array.isArray(grouping.references) || !Array.isArray(grouping.failures)) {
+    throw new Error('分类排序缺少有效的参考歌单，请重新预览')
+  }
+  const selected = new Set(ids)
+  const seen = new Set<number>()
+  const tags = new Map(playlist.trackIds.map((id) => [id, [] as number[]]))
+  for (const reference of grouping.references) {
+    if (!reference || !selected.has(reference.id) || seen.has(reference.id) || typeof reference.name !== 'string' ||
+        !Array.isArray(reference.matchedTrackIds) || new Set(reference.matchedTrackIds).size !== reference.matchedTrackIds.length ||
+        reference.matchedTrackIds.some((id: number) => !tags.has(id))) throw new Error('分类歌单交集无效，请重新预览')
+    seen.add(reference.id)
+    for (const id of reference.matchedTrackIds) tags.get(id)!.push(reference.id)
+  }
+  const successful = new Set(seen)
+  for (const failure of grouping.failures) {
+    if (!failure || !selected.has(failure.id) || seen.has(failure.id) || typeof failure.name !== 'string' ||
+        typeof failure.message !== 'string') throw new Error('分类歌单读取结果无效，请重新预览')
+    seen.add(failure.id)
+  }
+  if (seen.size !== ids.length || !sameIds(ids.filter((id) => successful.has(id)), grouping.references.map((item) => item.id)) ||
+      tracks.some((track) => !Array.isArray(track.playlistTags) || !sameIds(track.playlistTags, tags.get(track.songId) || []))) {
+    throw new Error('歌曲分类标记与参考歌单不一致，请重新预览')
+  }
+  return Object.freeze({
+    references: Object.freeze(grouping.references.map((item) => Object.freeze({
+      ...item, matchedTrackIds: Object.freeze([...item.matchedTrackIds]),
+    }))),
+    failures: Object.freeze(grouping.failures.map((item) => Object.freeze({ ...item }))),
+  })
 }
 
 function createPlan(
   userId: number, playlist: PlaylistSortSnapshot, options: PlaylistSortOptions, tracks: readonly PlaylistSortTrack[],
   playCountSummary: PlaylistSortPlayCountSummary | null = null,
-  combinedPlayCountSummaries: PlaylistSortPlan['combinedPlayCountSummaries'] = null
+  combinedPlayCountSummaries: PlaylistSortPlan['combinedPlayCountSummaries'] = null,
+  grouping: PlaylistSortGrouping | null = null
 ): PlaylistSortPlan {
+  const fixedGrouping = copyGrouping(grouping, playlist, options, tracks)
   const orderedTrackIds = sortPlaylistTracks(tracks, options)
   const originalIds = new Set(playlist.trackIds)
   if (orderedTrackIds.length !== playlist.trackIds.length || new Set(orderedTrackIds).size !== originalIds.size ||
       orderedTrackIds.some((id) => !originalIds.has(id))) throw new Error('排序结果未完整保留原歌单成员，本次不允许写入')
-  const knownCount = tracks.filter((track) => track.value !== null).length
+  const knownCount = tracks.filter((track) => options.rule === 'playlist-groups' ? track.playlistTags!.length > 0 : track.value !== null).length
   return Object.freeze({
-    userId, playlist, options: Object.freeze({ ...options }), tracks: freezeTracks(tracks), orderedTrackIds,
+    userId, playlist, options: freezeOptions(options), tracks: freezeTracks(tracks), orderedTrackIds,
     knownCount, missingCount: tracks.length - knownCount,
     changedCount: orderedTrackIds.filter((id, index) => playlist.trackIds[index] !== id).length,
     playCountSummary: playCountSummary ? Object.freeze({ ...playCountSummary }) : null,
     combinedPlayCountSummaries: combinedPlayCountSummaries ? Object.freeze({
       week: Object.freeze({ ...combinedPlayCountSummaries.week }), all: Object.freeze({ ...combinedPlayCountSummaries.all }),
     }) : null,
+    grouping: fixedGrouping,
   })
 }
 
@@ -155,9 +205,52 @@ async function previewCombinedSort(
 }
 
 /**
+ * 按参考歌单优先级读取完整成员并标记交集，再从原顺序逐段聚拢同类歌曲。
+ * 参考歌单只读；个别参考读取失败会列明并跳过，登录或限流异常停止预览，任何歌曲都不会因此省略。
+ */
+async function previewPlaylistGroups(
+  userId: number, playlist: PlaylistSortSnapshot, options: PlaylistSortOptions,
+  songs: ReadonlyMap<number, PlaylistSortSong>, onProgress?: (progress: PlaylistSortProgress) => void
+): Promise<PlaylistSortPlan> {
+  const available = (await getUserPlaylistsChecked(userId)).filter((item) => item.id !== playlist.id)
+  const byId = new Map(available.map((item) => [item.id, item]))
+  const ids = options.referencePlaylistIds || available.map((item) => item.id)
+  if (ids.some((id) => !byId.has(id))) throw new Error('参考歌单包含当前歌单或已不在账号列表中，请重新选择')
+  const references: PlaylistSortGrouping['references'][number][] = []
+  const failures: PlaylistSortGrouping['failures'][number][] = []
+  const tags = new Map(playlist.trackIds.map((id) => [id, [] as number[]]))
+  onProgress?.({ phase: 'categories', completed: 0, total: ids.length })
+  for (const id of ids) {
+    try {
+      const snapshot = await getPlaylistSortSnapshotChecked(id)
+      if (!hasCompleteTrackCount(snapshot)) throw new Error('参考歌单的成员数量不完整，本次不使用该分类')
+      const members = new Set(snapshot.trackIds)
+      const matchedTrackIds = playlist.trackIds.filter((songId) => members.has(songId))
+      references.push({ id, name: snapshot.name, matchedTrackIds })
+      for (const songId of matchedTrackIds) tags.get(songId)!.push(id)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '参考歌单读取失败'
+      if ((err instanceof NeteaseBusinessError && [301, 302, 401, 429].includes(err.code!)) ||
+          /Request failed:\s*(?:401|429)\b|登录|登陆|验证码|风控|频繁|请求过多/.test(message)) throw err
+      failures.push({ id, name: byId.get(id)!.name, message })
+    }
+    onProgress?.({ phase: 'categories', completed: references.length + failures.length, total: ids.length })
+  }
+  const tracks = playlist.trackIds.map((songId, index): PlaylistSortTrack => {
+    const song = songs.get(songId)
+    return { songId, name: song?.name || '', artists: song?.artists || [], originalPosition: index + 1,
+      value: null, playlistTags: tags.get(songId)!,
+    }
+  })
+  await assertUser(userId)
+  return createPlan(userId, playlist, { ...options, referencePlaylistIds: ids }, tracks, null, null, { references, failures })
+}
+
+/**
  * 只读生成完整歌单的新顺序：校验本人归属和成员完整性，加载指定指标，稳定排序并固定预览。
  * 加入时间来自成员 at，热度来自 pop，次数仅来自本人指定期间的听歌排行。
  * 组合模式依次按周次数、累计次数、热度、加入时间分组；单项模式保留原有规则。
+ * 分类聚拢模式使用其他歌单的成员交集，以原顺序中的未排定歌曲为起点逐段排列。
  * 缺失数据始终保留歌曲，不推测时间、不填充播放 0 次；任何接口失败都不会触发在线写入。
  */
 export async function previewPlaylistSort(
@@ -165,12 +258,13 @@ export async function previewPlaylistSort(
   onProgress?: (progress: PlaylistSortProgress) => void
 ): Promise<PlaylistSortPlan> {
   validatePlaylistSortOptions(options)
-  const fixedOptions = Object.freeze({ ...options })
+  const fixedOptions = freezeOptions(options)
   await assertUser(userId)
   onProgress?.({ phase: 'reading', completed: 0, total: 1 })
   const playlist = copySnapshot(await getPlaylistSortSnapshotChecked(playlistId), userId)
   const songs = await readSongs(playlist, fixedOptions.rule === 'popularity' || fixedOptions.rule === 'combined', onProgress)
   if (fixedOptions.rule === 'combined') return previewCombinedSort(userId, playlist, fixedOptions, songs, onProgress)
+  if (fixedOptions.rule === 'playlist-groups') return previewPlaylistGroups(userId, playlist, fixedOptions, songs, onProgress)
   const singleRule = fixedOptions.rule
   const counts = new Map<number, PlaylistSortPlayCount>()
   let playCountSummary: PlaylistSortPlayCountSummary | null = null
@@ -206,7 +300,7 @@ function copyPlan(preview: PlaylistSortPlan): PlaylistSortPlan {
         (preview.options.rule === 'combined' && track.metrics?.added !== playlist.addedTimes[index]))) {
     throw new Error('排序歌曲与完整歌单不一致，请重新预览')
   }
-  const plan = createPlan(preview.userId, playlist, preview.options, preview.tracks)
+  const plan = createPlan(preview.userId, playlist, preview.options, preview.tracks, null, null, preview.grouping)
   if (!Array.isArray(preview.orderedTrackIds) || !sameIds(plan.orderedTrackIds, preview.orderedTrackIds) ||
       plan.knownCount !== preview.knownCount || plan.missingCount !== preview.missingCount || plan.changedCount !== preview.changedCount) {
     throw new Error('排序结果与预览规则不一致，请重新预览')

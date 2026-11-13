@@ -1,4 +1,5 @@
 import type { PlaylistSortMetric, PlaylistSortMetrics, PlaylistSortOptions, PlaylistSortTrack } from '@/types/playlist-sort'
+import { groupPlaylistTracks } from './playlist-group-sort'
 
 export const PLAYLIST_SORT_LABELS = {
   added: '加入歌单的时间',
@@ -6,6 +7,7 @@ export const PLAYLIST_SORT_LABELS = {
   'plays-all': '本人累计听歌排行次数',
   'plays-week': '本人最近一周听歌排行次数',
   combined: '组合排序：周次数 → 累计次数 → 热度 → 加入时间',
+  'playlist-groups': '按已有歌单分类聚拢（适合“最近”）',
 } as const
 
 export const COMBINED_SORT_RULES: readonly PlaylistSortMetric[] = Object.freeze(['plays-week', 'plays-all', 'popularity', 'added'])
@@ -13,8 +15,13 @@ export const COMBINED_SORT_RULES: readonly PlaylistSortMetric[] = Object.freeze(
 export function validatePlaylistSortOptions(options: PlaylistSortOptions): void {
   if (!options || !Object.prototype.hasOwnProperty.call(PLAYLIST_SORT_LABELS, options.rule) ||
       !['asc', 'desc'].includes(options.direction) || !['last', 'keep'].includes(options.missing) ||
-      (options.rule === 'combined' && (options.direction !== 'desc' || options.missing !== 'last'))) {
+      (['combined', 'playlist-groups'].includes(options.rule) && (options.direction !== 'desc' || options.missing !== 'last'))) {
     throw new Error('排序规则、方向或缺失数据处理方式无效，请重新预览')
+  }
+  if (options.referencePlaylistIds !== undefined && (!Array.isArray(options.referencePlaylistIds) ||
+      new Set(options.referencePlaylistIds).size !== options.referencePlaylistIds.length ||
+      options.referencePlaylistIds.some((id) => !Number.isSafeInteger(id) || id <= 0))) {
+    throw new Error('分类歌单优先级无效，请重新预览')
   }
 }
 
@@ -47,10 +54,15 @@ export function sortPlaylistTracks(
   tracks: readonly PlaylistSortTrack[], options: PlaylistSortOptions
 ): readonly number[] {
   validatePlaylistSortOptions(options)
+  if (options.rule === 'playlist-groups') {
+    if (!Array.isArray(tracks)) throw new Error('分类排序歌曲数据无效，请重新预览')
+    return Object.freeze(groupPlaylistTracks(tracks, options.referencePlaylistIds || []).map((item) => item.songId))
+  }
+  const rule = options.rule
   if (!Array.isArray(tracks) || new Set(tracks.map((track) => track?.songId)).size !== tracks.length ||
       tracks.some((track, index) => !track || !Number.isSafeInteger(track.songId) || track.songId <= 0 ||
         track.originalPosition !== index + 1 ||
-        (options.rule !== 'combined' && !validPlaylistSortValue(track.value, options.rule)))) {
+        (rule !== 'combined' && !validPlaylistSortValue(track.value, rule)))) {
     throw new Error('歌曲排序数据无效，请重新读取歌单')
   }
   if (options.rule === 'combined') {
